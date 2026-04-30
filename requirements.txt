@@ -11,3 +11,4 @@ passlib==1.7.4
 pydantic[email]==2.12.5
 pytesseract
 pillow
+python-multipart
