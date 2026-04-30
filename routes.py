@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from deep_translator import GoogleTranslator
 from functools import lru_cache
@@ -7,6 +7,9 @@ from models import Traducao
 from schemas import TraducaoRequest
 from auth import decodificar_token
 from typing import Optional
+from PIL import Image
+import pytesseract
+import io
 
 router = APIRouter()
 
@@ -94,3 +97,59 @@ def deletar_traducao(traducao_id: int, db: Session = Depends(get_db)):
     db.commit()
 
     return {"mensagem": "Tradução removida com sucesso"}
+
+@router.post("/traduzir-imagem")
+async def traduzir_imagem(
+    file: UploadFile = File(...),
+    origem: str = Form(...),
+    destino: str = Form(...),
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db)
+):
+    try:
+        # 📷 ler imagem
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents))
+
+        # 🔍 OCR
+        texto_extraido = pytesseract.image_to_string(image)
+
+        if not texto_extraido.strip():
+            raise HTTPException(status_code=400, detail="Nenhum texto encontrado na imagem")
+
+        # 🌍 traduzir
+        traducao = GoogleTranslator(source=origem, target=destino).translate(texto_extraido)
+
+        registro_id = None
+
+        # 🔐 salva só se estiver autenticado
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization.split(" ")[1]
+            try:
+                decodificar_token(token)
+
+                registro = Traducao(
+                    texto=texto_extraido,
+                    traducao=traducao,
+                    origem=origem,
+                    destino=destino,
+                    modo="imagem",
+                )
+
+                db.add(registro)
+                db.commit()
+                db.refresh(registro)
+
+                registro_id = registro.id
+
+            except:
+                pass  # não quebra se token inválido
+
+        return {
+            "id": registro_id,
+            "texto_extraido": texto_extraido,
+            "traducao": traducao
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
