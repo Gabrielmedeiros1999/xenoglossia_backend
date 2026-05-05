@@ -7,9 +7,9 @@ from models import Traducao
 from schemas import TraducaoRequest
 from auth import decodificar_token
 from typing import Optional
+from groq import Groq
 import os
 import base64
-from groq import Groq
 
 router = APIRouter()
 
@@ -108,14 +108,10 @@ async def traduzir_imagem(
     db: Session = Depends(get_db)
 ):
     try:
-        # Ler e converter imagem para base64
         contents = await file.read()
         b64_image = base64.b64encode(contents).decode("utf-8")
-
-        # Detectar tipo da imagem
         content_type = file.content_type or "image/jpeg"
 
-        # Extrair texto com Groq LLaMA Vision
         client = get_groq_client()
         response = client.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
@@ -144,12 +140,9 @@ async def traduzir_imagem(
         if not texto_extraido:
             raise HTTPException(status_code=400, detail="Nenhum texto encontrado na imagem")
 
-        # Traduzir
         traducao = GoogleTranslator(source=origem, target=destino).translate(texto_extraido)
 
         registro_id = None
-
-        # Salva só se estiver autenticado
         if authorization and authorization.startswith("Bearer "):
             token = authorization.split(" ")[1]
             try:
@@ -171,6 +164,65 @@ async def traduzir_imagem(
         return {
             "id": registro_id,
             "texto_extraido": texto_extraido,
+            "traducao": traducao
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/traduzir-voz")
+async def traduzir_voz(
+    file: UploadFile = File(...),
+    origem: str = Form(...),
+    destino: str = Form(...),
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db)
+):
+    try:
+        contents = await file.read()
+
+        # Transcrição com Groq Whisper
+        client = get_groq_client()
+        transcricao = client.audio.transcriptions.create(
+            file=("audio.webm", contents, "audio/webm"),
+            model="whisper-large-v3-turbo",
+            language=origem,
+            response_format="text",
+        )
+
+        texto_transcrito = transcricao.strip() if isinstance(transcricao, str) else transcricao.text.strip()
+
+        if not texto_transcrito:
+            raise HTTPException(status_code=400, detail="Nenhuma fala detectada no áudio")
+
+        # Tradução
+        traducao = GoogleTranslator(source=origem, target=destino).translate(texto_transcrito)
+
+        registro_id = None
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization.split(" ")[1]
+            try:
+                decodificar_token(token)
+                registro = Traducao(
+                    texto=texto_transcrito,
+                    traducao=traducao,
+                    origem=origem,
+                    destino=destino,
+                    modo="voz",
+                )
+                db.add(registro)
+                db.commit()
+                db.refresh(registro)
+                registro_id = registro.id
+            except:
+                pass
+
+        return {
+            "id": registro_id,
+            "texto_transcrito": texto_transcrito,
             "traducao": traducao
         }
 
