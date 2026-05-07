@@ -15,7 +15,6 @@ router = APIRouter()
 
 # Carrega idiomas suportados
 IDIOMAS = GoogleTranslator(source='auto', target='en').get_supported_languages(as_dict=True)
-IDIOMAS_PT = {}
 
 # Cliente Groq
 def get_groq_client():
@@ -24,18 +23,11 @@ def get_groq_client():
         raise HTTPException(status_code=500, detail="GROQ_API_KEY não configurada")
     return Groq(api_key=api_key)
 
-
 # Cache de tradução
 @lru_cache(maxsize=1000)
 def traduzir_cache(texto: str, origem: str, destino: str):
     tradutor = GoogleTranslator(source=origem, target=destino)
     return tradutor.translate(texto)
-
-
-@router.get("/idiomas")
-def listar_idiomas():
-    return IDIOMAS_PT
-
 
 @router.post("/traduzir")
 def traduzir(
