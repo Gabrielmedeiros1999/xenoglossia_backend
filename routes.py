@@ -72,6 +72,9 @@ def traduzir(
         "traducao": texto_traduzido
     }
 
+@router.get("/health")
+def health():
+    return {"status": "ok"}
 
 @router.get("/historico")
 def historico(limit: int = 20, db: Session = Depends(get_db)):
