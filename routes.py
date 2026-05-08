@@ -72,7 +72,7 @@ def traduzir(
         "traducao": texto_traduzido
     }
 
-@router.get("/health")
+@router.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
 
