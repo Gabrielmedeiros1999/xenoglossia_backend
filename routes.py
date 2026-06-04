@@ -3,11 +3,12 @@ from sqlalchemy.orm import Session
 from deep_translator import GoogleTranslator
 from functools import lru_cache
 from database import get_db
-from models import Traducao
+from models import Traducao, Usuario
 from schemas import TraducaoRequest
-from auth import decodificar_token
+from auth import decodificar_token, get_usuario_atual
 from typing import Optional
 from groq import Groq
+from auth import decodificar_token, get_usuario_atual
 import os
 import base64
 
@@ -52,13 +53,18 @@ def traduzir(
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ")[1]
         try:
-            decodificar_token(token)
+            dados_token = decodificar_token(token)
+            usuario = db.query(Usuario)\
+                .filter(Usuario.email == dados_token["sub"])\
+                .first()
+            
             registro = Traducao(
                 texto=request.texto,
                 traducao=texto_traduzido,
                 origem=request.origem,
                 destino=request.destino,
                 modo=request.modo,
+                usuario_id=usuario.id
             )
             db.add(registro)
             db.commit()
@@ -77,16 +83,27 @@ def health():
     return {"status": "ok"}
 
 @router.get("/historico")
-def historico(limit: int = 20, db: Session = Depends(get_db)):
-    return db.query(Traducao)\
-        .order_by(Traducao.criado_em.desc())\
-        .limit(limit)\
+def historico(limit: int = 20, usuario: Usuario = Depends(get_usuario_atual), db: Session = Depends(get_db)):
+    return ( 
+        db.query(Traducao)
+        .filter(Traducao.usuario_id == usuario.id)
+        .order_by(Traducao.criado_em.desc())
+        .limit(limit)
         .all()
+    )
 
 
 @router.delete("/historico/{traducao_id}")
-def deletar_traducao(traducao_id: int, db: Session = Depends(get_db)):
-    registro = db.get(Traducao, traducao_id)
+def deletar_traducao(traducao_id: int, usuario: Usuario = Depends(get_usuario_atual), db: Session = Depends(get_db)):
+    registro = (
+        db.query(Traducao)
+        .filter(
+            Traducao.id == traducao_id,
+            Traducao.usuario_id == usuario.id
+        )
+        .first()
+    )
+
     if not registro:
         raise HTTPException(status_code=404, detail="Tradução não encontrada")
     db.delete(registro)
@@ -141,13 +158,19 @@ async def traduzir_imagem(
         if authorization and authorization.startswith("Bearer "):
             token = authorization.split(" ")[1]
             try:
-                decodificar_token(token)
+                dados_token = decodificar_token(token)
+
+                usuario = db.query(Usuario)\
+                    .filter(Usuario.email == dados_token["sub"])\
+                    .first()
+                
                 registro = Traducao(
                     texto=texto_extraido,
                     traducao=traducao,
                     origem=origem,
                     destino=destino,
                     modo="imagem",
+                    usuario_id=usuario.id
                 )
                 db.add(registro)
                 db.commit()
@@ -200,13 +223,19 @@ async def traduzir_voz(
         if authorization and authorization.startswith("Bearer "):
             token = authorization.split(" ")[1]
             try:
-                decodificar_token(token)
+                dados_token = decodificar_token(token)
+
+                usuario = db.query(Usuario)\
+                    .filter(Usuario.email == dados_token["sub"])\
+                    .first()
+                
                 registro = Traducao(
                     texto=texto_transcrito,
                     traducao=traducao,
                     origem=origem,
                     destino=destino,
                     modo="voz",
+                    usuario_id=usuario.id
                 )
                 db.add(registro)
                 db.commit()
