@@ -1,4 +1,30 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
+import re
+
+class UsuarioCadastro(BaseModel):
+    nome: str
+    email: EmailStr
+    senha: str
+
+    @field_validator("senha")
+    @classmethod
+    def validar_senha(cls, senha: str):
+        if len(senha) < 8:
+            raise ValueError(
+                "A senha deve ter pelo menos 8 caracteres"
+            )
+
+        if not re.search(r"[A-Z]", senha):
+            raise ValueError(
+                "A senha deve conter pelo menos uma letra maiúscula"
+            )
+
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", senha):
+            raise ValueError(
+                "A senha deve conter pelo menos um caractere especial"
+            )
+
+        return senha
 
 class TraducaoRequest(BaseModel):
     texto: str
