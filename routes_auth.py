@@ -43,5 +43,4 @@ def perfil_atual(usuario: Usuario = Depends(get_usuario_atual)):
         "id":         usuario.id,
         "nome":       usuario.nome,
         "email":      usuario.email,
-        "criado_em":  usuario.criado_em,
     }
