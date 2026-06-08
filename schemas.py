@@ -13,6 +13,11 @@ class UsuarioCadastro(BaseModel):
             raise ValueError(
                 "A senha deve ter pelo menos 8 caracteres"
             )
+        
+        if len(senha) > 64:
+            raise ValueError(
+                "A senha deve ter no máximo 64 caracteres"
+            )
 
         if not re.search(r"[A-Z]", senha):
             raise ValueError(
