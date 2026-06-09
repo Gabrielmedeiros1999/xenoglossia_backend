@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Usuario
-from schemas import UsuarioCadastro, UsuarioLogin, TokenResponse
+from schemas import UsuarioCadastro, UsuarioLogin, TokenResponse, UsuarioAtualizar
 from auth import hash_senha, verificar_senha, criar_token, get_usuario_atual
 
 router_auth = APIRouter(prefix="/auth", tags=["Auth"])
@@ -43,4 +43,37 @@ def perfil_atual(usuario: Usuario = Depends(get_usuario_atual)):
         "id":         usuario.id,
         "nome":       usuario.nome,
         "email":      usuario.email,
+    }
+
+@router_auth.put("/perfil")
+def atualizar_perfil(
+    dados: UsuarioAtualizar,
+    usuario: Usuario = Depends(get_usuario_atual),
+    db: Session = Depends(get_db)
+):
+    existe = (
+        db.query(Usuario)
+        .filter(
+            Usuario.email == dados.email,
+            Usuario.id != usuario.id
+        )
+        .first()
+    )
+
+    if existe:
+        raise HTTPException(
+            status_code=400,
+            detail="E-mail já está em uso"
+        )
+
+    usuario.nome = dados.nome
+    usuario.email = dados.email
+
+    db.commit()
+    db.refresh(usuario)
+
+    return {
+        "id": usuario.id,
+        "nome": usuario.nome,
+        "email": usuario.email,
     }

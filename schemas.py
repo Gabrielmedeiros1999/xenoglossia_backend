@@ -31,6 +31,9 @@ class UsuarioCadastro(BaseModel):
 
         return senha
 
+class UsuarioAtualizar(BaseModel):
+    nome: str
+    email: EmailStr
 class TraducaoRequest(BaseModel):
     texto: str
     origem: str
