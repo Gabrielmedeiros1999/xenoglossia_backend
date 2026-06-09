@@ -47,12 +47,14 @@ def decodificar_token(token: str) -> dict:
 
 def get_usuario_atual(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> Usuario:
     payload  = decodificar_token(token)
-    email    = payload.get("sub")
+    usuario_id = payload.get("sub")
 
-    if not email:
+    try:
+        usuario_id = int(usuario_id)
+    except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Token inválido")
-
-    usuario = db.query(Usuario).filter(Usuario.email == email).first()
+    
+    usuario = db.query(Usuario).filter(Usuario.id == usuario_id).first()
 
     if not usuario:
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
