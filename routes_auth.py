@@ -84,7 +84,18 @@ def alterar_senha(
     usuario: Usuario = Depends(get_usuario_atual),
     db: Session = Depends(get_db)
 ):
-    usuario.senha_hash = hash_senha(dados.senha)
+    if not verificar_senha(
+        dados.senha_atual,
+        usuario.senha_hash
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Senha atual incorreta"
+        )
+
+    usuario.senha_hash = hash_senha(
+        dados.nova_senha
+    )
 
     db.commit()
 

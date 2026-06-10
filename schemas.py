@@ -32,7 +32,34 @@ class UsuarioCadastro(BaseModel):
         return senha
 
 class AlterarSenhaSchema(BaseModel):
-    senha: str
+    senha_atual: str
+    nova_senha: str
+
+    @field_validator("nova_senha")
+    @classmethod
+    def validar_senha(cls, senha: str):
+        if len(senha) < 8:
+            raise ValueError(
+                "A senha deve ter pelo menos 8 caracteres"
+            )
+
+        if len(senha) > 64:
+            raise ValueError(
+                "A senha deve ter no máximo 64 caracteres"
+            )
+
+        if not re.search(r"[A-Z]", senha):
+            raise ValueError(
+                "A senha deve conter pelo menos uma letra maiúscula"
+            )
+
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", senha):
+            raise ValueError(
+                "A senha deve conter pelo menos um caractere especial"
+            )
+
+        return senha
+    
 class UsuarioAtualizar(BaseModel):
     nome: str
     email: EmailStr
@@ -46,11 +73,6 @@ class TraducaoResponse(BaseModel):
     id: int
     traducao: str
     arquivo_audio: str | None = None
-
-class UsuarioCadastro(BaseModel):
-    nome: str
-    email: EmailStr
-    senha: str
 
 class UsuarioLogin(BaseModel):
     email: EmailStr
