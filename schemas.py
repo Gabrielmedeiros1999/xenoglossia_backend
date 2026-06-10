@@ -31,6 +31,8 @@ class UsuarioCadastro(BaseModel):
 
         return senha
 
+class AlterarSenhaSchema(BaseModel):
+    senha: str
 class UsuarioAtualizar(BaseModel):
     nome: str
     email: EmailStr

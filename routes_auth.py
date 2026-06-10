@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Usuario
-from schemas import UsuarioCadastro, UsuarioLogin, TokenResponse, UsuarioAtualizar
+from schemas import UsuarioCadastro, UsuarioLogin, TokenResponse, UsuarioAtualizar, AlterarSenhaSchema
 from auth import hash_senha, verificar_senha, criar_token, get_usuario_atual
 
 router_auth = APIRouter(prefix="/auth", tags=["Auth"])
@@ -76,4 +76,18 @@ def atualizar_perfil(
         "id": usuario.id,
         "nome": usuario.nome,
         "email": usuario.email,
+    }
+
+@router_auth.put("/alterar-senha")
+def alterar_senha(
+    dados: AlterarSenhaSchema,
+    usuario: Usuario = Depends(get_usuario_atual),
+    db: Session = Depends(get_db)
+):
+    usuario.senha_hash = hash_senha(dados.senha)
+
+    db.commit()
+
+    return {
+        "mensagem": "Senha alterada com sucesso"
     }
