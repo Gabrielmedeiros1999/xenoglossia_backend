@@ -55,7 +55,7 @@ def traduzir(
         try:
             dados_token = decodificar_token(token)
             usuario = db.query(Usuario)\
-                .filter(Usuario.email == dados_token["sub"])\
+                .filter(Usuario.id == dados_token["sub"])\
                 .first()
             
             registro = Traducao(
@@ -161,7 +161,7 @@ async def traduzir_imagem(
                 dados_token = decodificar_token(token)
 
                 usuario = db.query(Usuario)\
-                    .filter(Usuario.email == dados_token["sub"])\
+                    .filter(Usuario.id == dados_token["sub"])\
                     .first()
                 
                 registro = Traducao(
@@ -226,7 +226,7 @@ async def traduzir_voz(
                 dados_token = decodificar_token(token)
 
                 usuario = db.query(Usuario)\
-                    .filter(Usuario.email == dados_token["sub"])\
+                    .filter(Usuario.id == dados_token["sub"])\
                     .first()
                 
                 registro = Traducao(
