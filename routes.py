@@ -69,14 +69,10 @@ def traduzir(
                 modo=request.modo,
                 usuario_id=usuario.id
             )
-            print("CRIANDO REGISTRO")
             db.add(registro)
-            print("ANTES DO COMMIT")
-
             db.commit()
-            print("DEPOIS DO COMMIT")
             db.refresh(registro)
-            print("ID GERADO:", registro.id)
+
             registro_id = registro.id
         except Exception as e:
             traceback.print_exc()
