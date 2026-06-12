@@ -8,9 +8,9 @@ from schemas import TraducaoRequest
 from auth import decodificar_token, get_usuario_atual
 from typing import Optional
 from groq import Groq
-from auth import decodificar_token, get_usuario_atual
 import os
 import base64
+import traceback
 
 router = APIRouter()
 
@@ -54,9 +54,12 @@ def traduzir(
         token = authorization.split(" ")[1]
         try:
             dados_token = decodificar_token(token)
+            print("TOKEN:", dados_token)
             usuario = db.query(Usuario)\
-                .filter(Usuario.id == dados_token["sub"])\
+                .filter(Usuario.id == int(dados_token["sub"]))\
                 .first()
+            
+            print("USUARIO:", usuario)
             
             registro = Traducao(
                 texto=request.texto,
@@ -70,8 +73,8 @@ def traduzir(
             db.commit()
             db.refresh(registro)
             registro_id = registro.id
-        except:
-            pass
+        except Exception as e:
+            traceback.print_exc()
 
     return {
         "id": registro_id,
@@ -161,7 +164,7 @@ async def traduzir_imagem(
                 dados_token = decodificar_token(token)
 
                 usuario = db.query(Usuario)\
-                    .filter(Usuario.id == dados_token["sub"])\
+                    .filter(Usuario.id == int(dados_token["sub"]))\
                     .first()
                 
                 registro = Traducao(
@@ -226,7 +229,7 @@ async def traduzir_voz(
                 dados_token = decodificar_token(token)
 
                 usuario = db.query(Usuario)\
-                    .filter(Usuario.id == dados_token["sub"])\
+                    .filter(Usuario.id == int(dados_token["sub"]))\
                     .first()
                 
                 registro = Traducao(
