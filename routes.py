@@ -15,6 +15,7 @@ from io import BytesIO
 import os
 import base64
 import traceback
+import time
 
 router = APIRouter()
 
@@ -164,19 +165,35 @@ async def traduzir_imagem(
         content_type = "image/jpeg"
 
         client = get_gemini_client()
-        response = client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=[
-                types.Part.from_bytes(
-                    data=contents,
-                    mime_type=content_type,
-                ),
-                """
+
+        tentativas = 3
+
+        for tentativa in range(tentativas):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-3.5-flash-lite",
+                    contents=[
+                        types.Part.from_bytes(
+                            data=contents,
+                            mime_type=content_type,
+                        ),
+                        """
         OCR only. Extract all text from this image.
         Return only the text. No explanations.
         """
-            ]
-        )
+                   ],
+                   config=types.GenerateContentConfig(
+                       temperature=0
+                   )
+                )
+                
+                break
+
+            except Exception as e:
+                if "503" in str(e) and tentativa < tentativas - 1:
+                    time.sleep(2 ** tentativa)
+                else:
+                    raise e
 
         texto_extraido = (response.text or "").strip()
 
