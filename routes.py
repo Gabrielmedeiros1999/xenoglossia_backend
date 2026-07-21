@@ -143,6 +143,10 @@ async def traduzir_imagem(
         
         image = Image.open(BytesIO(contents))
 
+        # Remove transparência/modos incompatíveis com JPEG
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
         # Reduz tamanho mantendo proporção
         image.thumbnail((1600, 1600))
 
@@ -151,7 +155,7 @@ async def traduzir_imagem(
         image.save(
             buffer,
             format="JPEG",
-            quality=85,
+            quality=90,
             optimize=True
         )
         
