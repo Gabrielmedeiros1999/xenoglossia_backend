@@ -12,3 +12,4 @@ pydantic[email]==2.12.5
 groq
 google-genai
 python-multipart
+Pillow

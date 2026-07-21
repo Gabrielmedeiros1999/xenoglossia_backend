@@ -10,6 +10,8 @@ from typing import Optional
 from groq import Groq
 from google import genai
 from google.genai import types
+from PIL import Image
+from io import BytesIO
 import os
 import base64
 import traceback
@@ -139,23 +141,35 @@ async def traduzir_imagem(
     try:
         contents = await file.read()
         
+        image = Image.open(BytesIO(contents))
+
+        # Reduz tamanho mantendo proporção
+        image.thumbnail((1600, 1600))
+
+        # Converte novamente para bytes
+        buffer = BytesIO()
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=85,
+            optimize=True
+        )
+        
+        contents = buffer.getvalue()
+
+        content_type = "image/jpeg"
+
         client = get_gemini_client()
         response = client.models.generate_content(
             model="gemini-3.5-flash",
             contents=[
                 types.Part.from_bytes(
                     data=contents,
-                    mime_type=file.content_type or "image/jpeg",
+                    mime_type=content_type,
                 ),
                 """
-        Extract all visible text from this image.
-
-        Rules:
-        - Return ONLY the extracted text.
-        - Do not translate.
-        - Do not explain.
-        - Preserve line breaks whenever possible.
-        - If there is no text, return an empty response.
+        OCR only. Extract all text from this image.
+        Return only the text. No explanations.
         """
             ]
         )
