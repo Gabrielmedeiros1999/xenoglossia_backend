@@ -8,6 +8,8 @@ from schemas import TraducaoRequest
 from auth import decodificar_token, get_usuario_atual
 from typing import Optional
 from groq import Groq
+from google import genai
+from google.genai import types
 import os
 import base64
 import traceback
@@ -23,6 +25,18 @@ def get_groq_client():
     if not api_key:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY não configurada")
     return Groq(api_key=api_key)
+
+# Cliente Gemini
+def get_gemini_client():
+    api_key = os.environ.get("GEMINI_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY não configurada"
+        )
+
+    return genai.Client(api_key=api_key)
 
 # Cache de tradução
 @lru_cache(maxsize=1000)
@@ -124,33 +138,29 @@ async def traduzir_imagem(
 ):
     try:
         contents = await file.read()
-        b64_image = base64.b64encode(contents).decode("utf-8")
-        content_type = file.content_type or "image/jpeg"
+        
+        client = get_gemini_client()
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_bytes(
+                    data=contents,
+                    mime_type=file.content_type or "image/jpeg",
+                ),
+                """
+        Extract all visible text from this image.
 
-        client = get_groq_client()
-        response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{content_type};base64,{b64_image}"
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": "Extract all visible text from this image. Return only the extracted text, no comments or explanations."
-                        }
-                    ]
-                }
-            ],
-            max_tokens=1024,
+        Rules:
+        - Return ONLY the extracted text.
+        - Do not translate.
+        - Do not explain.
+        - Preserve line breaks whenever possible.
+        - If there is no text, return an empty response.
+        """
+            ]
         )
 
-        texto_extraido = response.choices[0].message.content.strip()
+        texto_extraido = (response.text or "").strip()
 
         if not texto_extraido:
             raise HTTPException(status_code=400, detail="Nenhum texto encontrado na imagem")
