@@ -4,7 +4,7 @@ Backend do projeto open source de tradução, desenvolvido com FastAPI.
 
 ## Pré-requisitos
 
-- Python 3.11
+- Python 3.13.2
 - pip
 
 ## Instalação
