@@ -23,6 +23,11 @@ class UsuarioCadastro(BaseModel):
             raise ValueError(
                 "A senha deve conter pelo menos uma letra maiúscula"
             )
+        
+        if not re.search(r"[0-9]", senha):
+            raise ValueError(
+                "A senha deve conter pelo menos um número"
+            )
 
         if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", senha):
             raise ValueError(
@@ -48,6 +53,11 @@ class AlterarSenhaSchema(BaseModel):
                 "A senha deve ter no máximo 64 caracteres"
             )
 
+        if not re.search(r"[0-9]", senha):
+            raise ValueError(
+                "A senha deve conter pelo menos um número"
+            )
+        
         if not re.search(r"[A-Z]", senha):
             raise ValueError(
                 "A senha deve conter pelo menos uma letra maiúscula"
