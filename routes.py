@@ -117,9 +117,30 @@ def registrar_traducao(
         if not usuario:
             return None
 
+        texto_normalizado = texto.strip()
+        traducao_normalizada = traducao.strip()
+
+        # Evita duplicar quando já existe uma tradução idêntica no histórico do usuário, não importa quando foi feita.
+        existente = (
+            db.query(Traducao)
+            .filter(
+                Traducao.usuario_id == usuario.id,
+                Traducao.texto == texto_normalizado,
+                Traducao.traducao == traducao_normalizada,
+                Traducao.origem == origem,
+                Traducao.destino == destino,
+                Traducao.modo == modo,
+            )
+            .order_by(Traducao.criado_em.desc())
+            .first()
+        )
+
+        if existente:
+            return existente.id
+
         registro = Traducao(
-            texto=texto,
-            traducao=traducao,
+            texto=texto_normalizado,
+            traducao=traducao_normalizada,
             origem=origem,
             destino=destino,
             modo=modo,
