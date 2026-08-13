@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Usuario
+from models import Usuario, Traducao
 from schemas import UsuarioCadastro, UsuarioLogin, TokenResponse, UsuarioAtualizar, AlterarSenhaSchema
 from auth import hash_senha, verificar_senha, criar_token, get_usuario_atual
 
@@ -102,3 +102,16 @@ def alterar_senha(
     return {
         "mensagem": "Senha alterada com sucesso"
     }
+
+@router_auth.delete("/conta")
+def apagar_conta(
+    usuario: Usuario = Depends(get_usuario_atual),
+    db: Session = Depends(get_db)
+):
+    
+    db.query(Traducao).filter(Traducao.usuario_id == usuario.id).delete()
+
+    db.delete(usuario)
+    db.commit()
+
+    return {"mensagem": "Conta apagada com sucesso"}
