@@ -74,6 +74,22 @@ def traduzir_cache(texto: str, origem: str, destino: str):
     return tradutor.translate(texto)
 
 
+def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 3):
+    """Tenta traduzir com pequenas re-tentativas para absorver falhas
+    passageiras do deep-translator (timeout, instabilidade do Google, etc)."""
+    ultima_excecao = None
+
+    for tentativa in range(tentativas):
+        try:
+            return traduzir_cache(texto, origem, destino)
+        except Exception as e:
+            ultima_excecao = e
+            if tentativa < tentativas - 1:
+                time.sleep(0.4 * (tentativa + 1))  # 0.4s, 0.8s
+
+    raise ultima_excecao
+
+
 def validar_idiomas(origem: str, destino: str):
     """Garante que origem/destino são códigos de idioma suportados,
     evitando erros não tratados ou abuso do parâmetro."""
@@ -197,7 +213,7 @@ def traduzir(
     validar_idiomas(request.origem, request.destino)
 
     try:
-        texto_traduzido = traduzir_cache(
+        texto_traduzido = traduzir_com_retry(
             request.texto.strip(),
             request.origem,
             request.destino
