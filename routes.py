@@ -269,6 +269,15 @@ def deletar_traducao(traducao_id: int, usuario: Usuario = Depends(get_usuario_at
     db.commit()
     return {"mensagem": "Tradução removida com sucesso"}
 
+@router.delete("/historico")
+def apagar_todo_historico(usuario: Usuario = Depends(get_usuario_atual), db: Session = Depends(get_db)):
+    removidos = (
+        db.query(Traducao)
+        .filter(Traducao.usuario_id == usuario.id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {"mensagem": "Histórico apagado com sucesso", "removidos": removidos}
 
 @router.post("/traduzir-imagem")
 async def traduzir_imagem(
