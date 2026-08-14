@@ -26,6 +26,10 @@ CODIGOS_VALIDOS = set(IDIOMAS.values())
 MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 8 MB
 MAX_AUDIO_BYTES = 15 * 1024 * 1024  # 15 MB
 
+# Máximo de traduções mantidas no histórico de cada usuário.
+# Ao ultrapassar, as mais antigas são removidas automaticamente.
+LIMITE_HISTORICO = 100
+
 # Trechos que sugerem que o modelo saiu do papel de "OCR literal"
 # e passou a responder/executar em vez de apenas transcrever.
 MARCADORES_SUSPEITOS = [
@@ -93,6 +97,32 @@ def contem_conteudo_suspeito(texto: str) -> bool:
     return any(marcador in texto_lower for marcador in MARCADORES_SUSPEITOS)
 
 
+def limitar_historico(db: Session, usuario_id: int, limite: int = LIMITE_HISTORICO) -> None:
+    """Mantém apenas as `limite` traduções mais recentes do usuário,
+    apagando as mais antigas quando o total ultrapassa esse número."""
+    total = db.query(Traducao).filter(Traducao.usuario_id == usuario_id).count()
+
+    if total <= limite:
+        return
+
+    excedente = total - limite
+
+    ids_antigos = (
+        db.query(Traducao.id)
+        .filter(Traducao.usuario_id == usuario_id)
+        .order_by(Traducao.criado_em.asc())
+        .limit(excedente)
+        .all()
+    )
+    ids_antigos = [row.id for row in ids_antigos]
+
+    if ids_antigos:
+        db.query(Traducao)\
+            .filter(Traducao.id.in_(ids_antigos))\
+            .delete(synchronize_session=False)
+        db.commit()
+
+
 def registrar_traducao(
     db: Session,
     authorization: Optional[str],
@@ -149,6 +179,9 @@ def registrar_traducao(
         db.add(registro)
         db.commit()
         db.refresh(registro)
+
+        limitar_historico(db, usuario.id)
+
         return registro.id
     except Exception:
         traceback.print_exc()
