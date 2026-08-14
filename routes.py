@@ -226,7 +226,7 @@ def health():
 
 
 @router.get("/historico")
-def historico(limit: int = 20, usuario: Usuario = Depends(get_usuario_atual), db: Session = Depends(get_db)):
+def historico(limit: int = LIMITE_HISTORICO, usuario: Usuario = Depends(get_usuario_atual), db: Session = Depends(get_db)):
     return (
         db.query(Traducao)
         .filter(Traducao.usuario_id == usuario.id)
