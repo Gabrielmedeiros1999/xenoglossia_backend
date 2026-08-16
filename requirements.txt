@@ -13,3 +13,4 @@ groq
 google-genai
 python-multipart
 Pillow
+nltk==3.9.1

@@ -1,10 +1,11 @@
 from fastapi import APIRouter, HTTPException, Depends, Header, UploadFile, File, Form
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from deep_translator import GoogleTranslator
 from functools import lru_cache
 from database import get_db
 from models import Traducao, Usuario
-from schemas import TraducaoRequest
+from schemas import TraducaoRequest, SentimentoRequest
 from auth import decodificar_token, get_usuario_atual
 from typing import Optional
 from groq import Groq
@@ -12,6 +13,8 @@ from google import genai
 from google.genai import types
 from PIL import Image
 from io import BytesIO
+import nltk
+from nltk.sentiment import SentimentIntensityAnalyzer
 import os
 import traceback
 import time
@@ -88,6 +91,39 @@ def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 
                 time.sleep(0.4 * (tentativa + 1))  # 0.4s, 0.8s
 
     raise ultima_excecao
+
+
+@lru_cache(maxsize=1)
+def get_analisador_sentimento() -> SentimentIntensityAnalyzer:
+    try:
+        nltk.data.find("sentiment/vader_lexicon.zip")
+    except LookupError:
+        nltk.download("vader_lexicon", quiet=True)
+
+    return SentimentIntensityAnalyzer()
+
+
+@lru_cache(maxsize=1000)
+def classificar_sentimento_cache(texto: str) -> str:
+    """
+    VADER só entende inglês, então traduzimos o texto antes de
+    analisar — reaproveitando o mesmo GoogleTranslator já usado
+    no restante do projeto, sem depender de modelos pesados."""
+    try:
+        texto_em_ingles = traduzir_com_retry(texto, "auto", "en")
+    except Exception:
+        # Se a tradução falhar mesmo após as tentativas, analisa o texto original.
+        texto_em_ingles = texto
+
+    analisador = get_analisador_sentimento()
+    scores = analisador.polarity_scores(texto_em_ingles or texto)
+    compound = scores["compound"]
+
+    if compound >= 0.05:
+        return "positivo"
+    elif compound <= -0.05:
+        return "negativo"
+    return "neutro"
 
 
 def validar_idiomas(origem: str, destino: str):
@@ -234,6 +270,21 @@ def traduzir(
         "id": registro_id,
         "traducao": texto_traduzido
     }
+
+
+@router.post("/analisar-sentimento")
+def analisar_sentimento(request: SentimentoRequest):
+    texto = request.texto.strip()
+
+    if not texto:
+        raise HTTPException(status_code=400, detail="Texto vazio")
+
+    try:
+        sentimento = classificar_sentimento_cache(texto)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erro ao analisar sentimento")
+
+    return {"sentimento": sentimento}
 
 
 @router.api_route("/health", methods=["GET", "HEAD"])
