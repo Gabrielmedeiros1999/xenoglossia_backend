@@ -423,7 +423,7 @@ async def traduzir_imagem(
                 detail="Não foi possível extrair o texto da imagem com segurança"
             )
 
-        traducao = GoogleTranslator(source=origem, target=destino).translate(texto_extraido)
+        traducao = traduzir_com_retry(texto_extraido, origem, destino)
 
         registro_id = registrar_traducao(
             db, authorization,
@@ -474,7 +474,7 @@ async def traduzir_voz(
         if not texto_transcrito:
             raise HTTPException(status_code=400, detail="Nenhuma fala detectada no áudio")
 
-        traducao = GoogleTranslator(source=origem, target=destino).translate(texto_transcrito)
+        traducao = traduzir_com_retry(texto_transcrito, origem, destino)
 
         registro_id = registrar_traducao(
             db, authorization,
