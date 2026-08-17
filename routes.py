@@ -15,6 +15,7 @@ from PIL import Image
 from io import BytesIO
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
+from datetime import datetime, date
 import os
 import traceback
 import time
@@ -290,6 +291,25 @@ def analisar_sentimento(request: SentimentoRequest):
 @router.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
+
+
+@router.get("/estatisticas/hoje")
+def estatisticas_hoje(usuario: Usuario = Depends(get_usuario_atual), db: Session = Depends(get_db)):
+    inicio_dia = datetime.combine(date.today(), datetime.min.time())
+    fim_dia = datetime.combine(date.today(), datetime.max.time())
+
+    query_base = db.query(Traducao).filter(
+        Traducao.usuario_id == usuario.id,
+        Traducao.criado_em >= inicio_dia,
+        Traducao.criado_em <= fim_dia,
+    )
+
+    total = query_base.count()
+    modalidades = [
+        row[0] for row in query_base.with_entities(Traducao.modo).distinct().all()
+    ]
+
+    return {"total": total, "modalidades": modalidades}
 
 
 @router.get("/historico")
