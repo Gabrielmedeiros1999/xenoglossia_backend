@@ -91,6 +91,18 @@ def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 
             if tentativa < tentativas - 1:
                 time.sleep(0.4 * (tentativa + 1))  # 0.4s, 0.8s
 
+    # Fallback: se a tradução com o idioma de origem informado continuar
+    # falhando mesmo após as tentativas, tenta detectar automaticamente
+    # o idioma real do texto. Cobre o caso comum de o idioma de origem
+    # selecionado não bater com o texto de fato (ex: usuário trocou de
+    # aba/modo sem ajustar o idioma, ou o texto extraído da imagem/áudio
+    # está em outro idioma).
+    if origem != "auto":
+        try:
+            return traduzir_cache(texto, "auto", destino)
+        except Exception as e:
+            ultima_excecao = e
+
     raise ultima_excecao
 
 
