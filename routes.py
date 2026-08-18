@@ -1,18 +1,30 @@
-from fastapi import APIRouter, HTTPException, Depends, Header, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Depends, Header, Request, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from deep_translator import GoogleTranslator
 from functools import lru_cache
+from collections import defaultdict, deque
 from database import get_db
 from models import Traducao, Usuario
 from schemas import TraducaoRequest, SentimentoRequest
 from auth import decodificar_token, get_usuario_atual
 from typing import Optional
+import hashlib
+import threading
 from groq import Groq
 from google import genai
 from google.genai import types
 from PIL import Image
 from io import BytesIO
+from pypdf import PdfReader
+from docx import Document as DocxDocument
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from xml.sax.saxutils import escape as escapar_xml
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 from datetime import datetime, date
@@ -26,9 +38,26 @@ router = APIRouter()
 IDIOMAS = GoogleTranslator(source='auto', target='en').get_supported_languages(as_dict=True)
 CODIGOS_VALIDOS = set(IDIOMAS.values())
 
-# Limites de upload
-MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 8 MB
-MAX_AUDIO_BYTES = 15 * 1024 * 1024  # 15 MB
+
+MAX_IMAGE_BYTES = 8 * 1024 * 1024     
+MAX_AUDIO_BYTES = 15 * 1024 * 1024    
+MAX_DOCUMENT_BYTES = 20 * 1024 * 1024  
+
+EXTENSOES_DOCUMENTO_VALIDAS = {"pdf", "txt", "docx"}
+
+FORMATOS_SAIDA_VALIDOS = {"texto", "pdf", "docx"}
+
+# Tamanho máximo de bloco de texto enviado por vez ao tradutor
+LIMITE_CHARS_TRADUCAO = 4500
+
+# limitamos quantas requisições um mesmo cliente pode fazer por janela de
+# tempo, para conter abuso/flood do mesmo arquivo (ou de arquivos diferentes).
+RATE_LIMIT_DOCUMENTO_MAX_REQUISICOES = 5
+RATE_LIMIT_DOCUMENTO_JANELA_SEGUNDOS = 60
+
+# TTL do cache de tradução de documentos: evita retraduzir o mesmo texto
+CACHE_TRADUCAO_DOCUMENTO_TTL_SEGUNDOS = 15 * 60
+CACHE_TRADUCAO_DOCUMENTO_MAX_ENTRADAS = 500
 
 # Máximo de traduções mantidas no histórico de cada usuário.
 # Ao ultrapassar, as mais antigas são removidas automaticamente.
@@ -152,6 +181,280 @@ def validar_tamanho(contents: bytes, limite: int, tipo: str):
             status_code=413,
             detail=f"Arquivo de {tipo} excede o tamanho máximo permitido"
         )
+
+_rate_limit_lock = threading.Lock()
+_rate_limit_registros: dict[str, deque] = defaultdict(deque)
+
+
+def verificar_rate_limit_documento(identificador: str) -> None:
+    """Bloqueia com 429 quando `identificador` (normalmente o IP do
+    cliente) excede o número de requisições permitidas na janela de tempo
+    configurada. Protege a rota de tradução de documentos contra flood do
+    mesmo arquivo ou de arquivos diferentes em sequência."""
+    agora = time.monotonic()
+
+    with _rate_limit_lock:
+        registros = _rate_limit_registros[identificador]
+
+        # Descarta registros fora da janela.
+        while registros and agora - registros[0] > RATE_LIMIT_DOCUMENTO_JANELA_SEGUNDOS:
+            registros.popleft()
+
+        if len(registros) >= RATE_LIMIT_DOCUMENTO_MAX_REQUISICOES:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Muitas traduções de documento em pouco tempo. "
+                    "Aguarde um momento antes de tentar novamente."
+                )
+            )
+
+        registros.append(agora)
+
+# Evita retraduzir o mesmo texto quando o usuário pede o mesmo documento em
+
+_cache_traducao_documento_lock = threading.Lock()
+_cache_traducao_documento: dict[str, tuple[str, float]] = {}
+
+
+def _chave_cache_traducao_documento(texto: str, origem: str, destino: str) -> str:
+    bruto = f"{origem}:{destino}:{texto}".encode("utf-8")
+    return hashlib.sha256(bruto).hexdigest()
+
+
+def obter_traducao_documento_cache(texto: str, origem: str, destino: str) -> Optional[str]:
+    chave = _chave_cache_traducao_documento(texto, origem, destino)
+    agora = time.monotonic()
+
+    with _cache_traducao_documento_lock:
+        item = _cache_traducao_documento.get(chave)
+        if not item:
+            return None
+
+        traducao, expira_em = item
+        if agora > expira_em:
+            del _cache_traducao_documento[chave]
+            return None
+
+        return traducao
+
+
+def salvar_traducao_documento_cache(texto: str, origem: str, destino: str, traducao: str) -> None:
+    chave = _chave_cache_traducao_documento(texto, origem, destino)
+    expira_em = time.monotonic() + CACHE_TRADUCAO_DOCUMENTO_TTL_SEGUNDOS
+
+    with _cache_traducao_documento_lock:
+        if len(_cache_traducao_documento) >= CACHE_TRADUCAO_DOCUMENTO_MAX_ENTRADAS:
+            # Limpeza oportunista: remove apenas entradas já expiradas.
+            agora = time.monotonic()
+            expiradas = [k for k, (_, exp) in _cache_traducao_documento.items() if exp < agora]
+            for k in expiradas:
+                del _cache_traducao_documento[k]
+
+        _cache_traducao_documento[chave] = (traducao, expira_em)
+
+
+def extrair_extensao(nome_arquivo: Optional[str]) -> str:
+    if not nome_arquivo or "." not in nome_arquivo:
+        return ""
+    return nome_arquivo.rsplit(".", 1)[-1].lower()
+
+
+def extrair_texto_txt(contents: bytes) -> str:
+    for encoding in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return contents.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise HTTPException(status_code=400, detail="Não foi possível ler a codificação do arquivo TXT")
+
+
+def extrair_texto_pdf(contents: bytes) -> str:
+    try:
+        leitor = PdfReader(BytesIO(contents))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Arquivo PDF inválido")
+
+    if getattr(leitor, "is_encrypted", False):
+        raise HTTPException(status_code=400, detail="Arquivo PDF protegido por senha não é suportado")
+
+    try:
+        texto = "\n".join(pagina.extract_text() or "" for pagina in leitor.pages)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Não foi possível extrair texto do PDF")
+
+    return texto.strip()
+
+
+def extrair_texto_docx(contents: bytes) -> str:
+    try:
+        documento = DocxDocument(BytesIO(contents))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Arquivo DOCX inválido")
+
+    partes = [paragrafo.text for paragrafo in documento.paragraphs]
+
+    # Também extrai texto de dentro de tabelas, comum em documentos formatados.
+    for tabela in documento.tables:
+        for linha in tabela.rows:
+            for celula in linha.cells:
+                if celula.text.strip():
+                    partes.append(celula.text)
+
+    return "\n".join(partes).strip()
+
+
+def extrair_texto_documento(contents: bytes, extensao: str) -> str:
+    if extensao == "txt":
+        return extrair_texto_txt(contents)
+    elif extensao == "pdf":
+        return extrair_texto_pdf(contents)
+    elif extensao == "docx":
+        return extrair_texto_docx(contents)
+    raise HTTPException(status_code=400, detail="Formato de arquivo não suportado. Envie PDF, TXT ou DOCX")
+
+
+def dividir_texto_em_blocos(texto: str, limite: int = LIMITE_CHARS_TRADUCAO) -> list[str]:
+    """Divide o texto em blocos menores que `limite`, tentando respeitar
+    quebras de linha para não cortar frases no meio. Necessário porque
+    documentos podem exceder o limite de caracteres aceito pelo tradutor."""
+    if len(texto) <= limite:
+        return [texto]
+
+    blocos = []
+    bloco_atual = ""
+
+    for linha in texto.split("\n"):
+        candidato = f"{bloco_atual}\n{linha}" if bloco_atual else linha
+
+        if len(candidato) <= limite:
+            bloco_atual = candidato
+            continue
+
+        if bloco_atual:
+            blocos.append(bloco_atual)
+            bloco_atual = ""
+
+        if len(linha) > limite:
+            for i in range(0, len(linha), limite):
+                blocos.append(linha[i:i + limite])
+        else:
+            bloco_atual = linha
+
+    if bloco_atual:
+        blocos.append(bloco_atual)
+
+    return blocos
+
+
+def traduzir_texto_longo(texto: str, origem: str, destino: str) -> str:
+    """Traduz textos de qualquer tamanho, dividindo em blocos quando necessário
+    e remontando o resultado preservando a estrutura de linhas original."""
+    blocos = dividir_texto_em_blocos(texto)
+    traduzidos = []
+
+    for bloco in blocos:
+        if not bloco.strip():
+            traduzidos.append(bloco)
+            continue
+        traduzidos.append(traduzir_com_retry(bloco, origem, destino))
+
+    return "\n".join(traduzidos)
+
+
+# Nome interno usado para a fonte Unicode registrada no reportlab
+FONTE_UNICODE_NOME = "DejaVuSans"
+
+# Cache simples: evita tentar localizar/registrar a fonte a cada requisição
+_FONTE_PDF_RESOLVIDA: Optional[str] = None
+
+
+def _localizar_arquivo_fonte_dejavu() -> Optional[str]:
+    
+    candidatos = []
+
+    caminho_env = os.environ.get("DEJAVU_FONT_PATH")
+    if caminho_env:
+        candidatos.append(caminho_env)
+
+    candidatos.append(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DejaVuSans.ttf")
+    )
+
+    try:
+        import matplotlib
+        candidatos.append(
+            os.path.join(
+                os.path.dirname(matplotlib.__file__),
+                "mpl-data", "fonts", "ttf", "DejaVuSans.ttf"
+            )
+        )
+    except ImportError:
+        pass
+
+    candidatos.append("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+
+    for caminho in candidatos:
+        if caminho and os.path.isfile(caminho):
+            return caminho
+
+    return None
+
+
+def _resolver_fonte_pdf() -> str:
+   
+    global _FONTE_PDF_RESOLVIDA
+
+    if _FONTE_PDF_RESOLVIDA:
+        return _FONTE_PDF_RESOLVIDA
+
+    caminho_fonte = _localizar_arquivo_fonte_dejavu()
+
+    if caminho_fonte:
+        try:
+            pdfmetrics.registerFont(TTFont(FONTE_UNICODE_NOME, caminho_fonte))
+            _FONTE_PDF_RESOLVIDA = FONTE_UNICODE_NOME
+            return _FONTE_PDF_RESOLVIDA
+        except Exception:
+            traceback.print_exc()
+
+    _FONTE_PDF_RESOLVIDA = "Helvetica"
+    return _FONTE_PDF_RESOLVIDA
+
+
+def gerar_pdf_traduzido(texto: str) -> bytes:
+  
+    buffer = BytesIO()
+    documento_pdf = SimpleDocTemplate(buffer, pagesize=A4)
+
+    estilo = getSampleStyleSheet()["Normal"]
+    estilo.fontName = _resolver_fonte_pdf()
+
+    elementos = []
+    for linha in texto.split("\n"):
+        if linha.strip():
+            elementos.append(Paragraph(escapar_xml(linha), estilo))
+        else:
+            elementos.append(Spacer(1, 12))
+
+    if not elementos:
+        elementos.append(Paragraph("", estilo))
+
+    documento_pdf.build(elementos)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def gerar_docx_traduzido(texto: str) -> bytes:
+    
+    documento = DocxDocument()
+    for linha in texto.split("\n"):
+        documento.add_paragraph(linha)
+
+    buffer = BytesIO()
+    documento.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def contem_conteudo_suspeito(texto: str) -> bool:
@@ -522,6 +825,82 @@ async def traduzir_voz(
             "texto_transcrito": texto_transcrito,
             "traducao": traducao
         }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/traduzir-documento")
+async def traduzir_documento(
+    request: Request,
+    file: UploadFile = File(...),
+    origem: str = Form(...),
+    destino: str = Form(...),
+    formato_saida: str = Form(default="texto"),  
+):
+   
+    identificador_cliente = request.client.host if request.client else "desconhecido"
+    verificar_rate_limit_documento(identificador_cliente)
+
+    validar_idiomas(origem, destino)
+
+    formato_saida = formato_saida.strip().lower()
+    if formato_saida not in FORMATOS_SAIDA_VALIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail="formato_saida deve ser 'texto', 'pdf' ou 'docx'"
+        )
+
+    extensao = extrair_extensao(file.filename)
+    if extensao not in EXTENSOES_DOCUMENTO_VALIDAS:
+        raise HTTPException(
+            status_code=400,
+            detail="Formato de arquivo não suportado. Envie um PDF, TXT ou DOCX"
+        )
+
+    try:
+        contents = await file.read()
+        validar_tamanho(contents, MAX_DOCUMENT_BYTES, "documento")
+
+        texto_extraido = extrair_texto_documento(contents, extensao)
+
+        if not texto_extraido.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Nenhum texto encontrado no documento"
+            )
+
+        texto_traduzido = obter_traducao_documento_cache(texto_extraido, origem, destino)
+        if texto_traduzido is None:
+            texto_traduzido = traduzir_texto_longo(texto_extraido, origem, destino)
+            salvar_traducao_documento_cache(texto_extraido, origem, destino, texto_traduzido)
+
+        if formato_saida == "texto":
+            return {
+                "texto_extraido": texto_extraido,
+                "traducao": texto_traduzido,
+            }
+
+        if formato_saida == "pdf":
+            pdf_bytes = gerar_pdf_traduzido(texto_traduzido)
+            return StreamingResponse(
+                BytesIO(pdf_bytes),
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": "attachment; filename=documento_traduzido.pdf"
+                }
+            )
+
+        docx_bytes = gerar_docx_traduzido(texto_traduzido)
+        return StreamingResponse(
+            BytesIO(docx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": "attachment; filename=documento_traduzido.docx"
+            }
+        )
 
     except HTTPException:
         raise
