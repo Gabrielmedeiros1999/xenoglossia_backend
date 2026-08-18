@@ -12,6 +12,7 @@ from auth import decodificar_token, get_usuario_atual
 from typing import Optional
 import hashlib
 import threading
+import re
 from groq import Groq
 from google import genai
 from google.genai import types
@@ -20,7 +21,7 @@ from io import BytesIO
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -38,10 +39,11 @@ router = APIRouter()
 IDIOMAS = GoogleTranslator(source='auto', target='en').get_supported_languages(as_dict=True)
 CODIGOS_VALIDOS = set(IDIOMAS.values())
 
+# Limites de upload
+MAX_IMAGE_BYTES = 8 * 1024 * 1024     # 8 MB
+MAX_AUDIO_BYTES = 15 * 1024 * 1024    # 15 MB
+MAX_DOCUMENT_BYTES = 20 * 1024 * 1024  # 20 MB
 
-MAX_IMAGE_BYTES = 8 * 1024 * 1024     
-MAX_AUDIO_BYTES = 15 * 1024 * 1024    
-MAX_DOCUMENT_BYTES = 20 * 1024 * 1024  
 
 EXTENSOES_DOCUMENTO_VALIDAS = {"pdf", "txt", "docx"}
 
@@ -55,7 +57,7 @@ LIMITE_CHARS_TRADUCAO = 4500
 RATE_LIMIT_DOCUMENTO_MAX_REQUISICOES = 5
 RATE_LIMIT_DOCUMENTO_JANELA_SEGUNDOS = 60
 
-# TTL do cache de tradução de documentos: evita retraduzir o mesmo texto
+
 CACHE_TRADUCAO_DOCUMENTO_TTL_SEGUNDOS = 15 * 60
 CACHE_TRADUCAO_DOCUMENTO_MAX_ENTRADAS = 500
 
@@ -211,7 +213,6 @@ def verificar_rate_limit_documento(identificador: str) -> None:
 
         registros.append(agora)
 
-# Evita retraduzir o mesmo texto quando o usuário pede o mesmo documento em
 
 _cache_traducao_documento_lock = threading.Lock()
 _cache_traducao_documento: dict[str, tuple[str, float]] = {}
@@ -260,13 +261,52 @@ def extrair_extensao(nome_arquivo: Optional[str]) -> str:
     return nome_arquivo.rsplit(".", 1)[-1].lower()
 
 
+_PADRAO_MARCADOR_LISTA = re.compile(r"^\s*([-•*]|\d+[.)])\s+")
+
+
+def reconstruir_paragrafos(texto: str) -> str:
+   
+    paragrafos: list[str] = []
+    atual = ""
+
+    def fechar_paragrafo_atual():
+        nonlocal atual
+        if atual.strip():
+            paragrafos.append(atual.strip())
+        atual = ""
+
+    for linha in texto.split("\n"):
+        linha_limpa = linha.strip()
+
+        if not linha_limpa:
+            fechar_paragrafo_atual()
+            continue
+
+        if _PADRAO_MARCADOR_LISTA.match(linha_limpa):
+            fechar_paragrafo_atual()
+            paragrafos.append(linha_limpa)
+            continue
+
+        atual = f"{atual} {linha_limpa}".strip() if atual else linha_limpa
+
+    fechar_paragrafo_atual()
+
+    return "\n\n".join(paragrafos)
+
+
 def extrair_texto_txt(contents: bytes) -> str:
+    texto = None
     for encoding in ("utf-8", "utf-16", "latin-1"):
         try:
-            return contents.decode(encoding)
+            texto = contents.decode(encoding)
+            break
         except UnicodeDecodeError:
             continue
-    raise HTTPException(status_code=400, detail="Não foi possível ler a codificação do arquivo TXT")
+
+    if texto is None:
+        raise HTTPException(status_code=400, detail="Não foi possível ler a codificação do arquivo TXT")
+
+    return "\n\n".join(texto.split("\n"))
 
 
 def extrair_texto_pdf(contents: bytes) -> str:
@@ -279,11 +319,11 @@ def extrair_texto_pdf(contents: bytes) -> str:
         raise HTTPException(status_code=400, detail="Arquivo PDF protegido por senha não é suportado")
 
     try:
-        texto = "\n".join(pagina.extract_text() or "" for pagina in leitor.pages)
+        texto_bruto = "\n".join(pagina.extract_text() or "" for pagina in leitor.pages)
     except Exception:
         raise HTTPException(status_code=400, detail="Não foi possível extrair texto do PDF")
 
-    return texto.strip()
+    return reconstruir_paragrafos(texto_bruto)
 
 
 def extrair_texto_docx(contents: bytes) -> str:
@@ -294,14 +334,14 @@ def extrair_texto_docx(contents: bytes) -> str:
 
     partes = [paragrafo.text for paragrafo in documento.paragraphs]
 
-    # Também extrai texto de dentro de tabelas, comum em documentos formatados.
+    
     for tabela in documento.tables:
         for linha in tabela.rows:
             for celula in linha.cells:
                 if celula.text.strip():
                     partes.append(celula.text)
 
-    return "\n".join(partes).strip()
+    return "\n\n".join(p for p in partes if p.strip())
 
 
 def extrair_texto_documento(contents: bytes, extensao: str) -> str:
@@ -314,52 +354,57 @@ def extrair_texto_documento(contents: bytes, extensao: str) -> str:
     raise HTTPException(status_code=400, detail="Formato de arquivo não suportado. Envie PDF, TXT ou DOCX")
 
 
-def dividir_texto_em_blocos(texto: str, limite: int = LIMITE_CHARS_TRADUCAO) -> list[str]:
-    """Divide o texto em blocos menores que `limite`, tentando respeitar
-    quebras de linha para não cortar frases no meio. Necessário porque
-    documentos podem exceder o limite de caracteres aceito pelo tradutor."""
-    if len(texto) <= limite:
-        return [texto]
+def dividir_em_paragrafos(texto: str) -> list[str]:
+    return [p.strip() for p in texto.split("\n\n") if p.strip()]
+
+
+def _dividir_paragrafo_longo(paragrafo: str, limite: int) -> list[str]:
+    if len(paragrafo) <= limite:
+        return [paragrafo]
 
     blocos = []
-    bloco_atual = ""
+    atual = ""
 
-    for linha in texto.split("\n"):
-        candidato = f"{bloco_atual}\n{linha}" if bloco_atual else linha
+    for palavra in paragrafo.split(" "):
+        candidato = f"{atual} {palavra}".strip() if atual else palavra
 
         if len(candidato) <= limite:
-            bloco_atual = candidato
+            atual = candidato
             continue
 
-        if bloco_atual:
-            blocos.append(bloco_atual)
-            bloco_atual = ""
+        if atual:
+            blocos.append(atual)
+            atual = ""
 
-        if len(linha) > limite:
-            for i in range(0, len(linha), limite):
-                blocos.append(linha[i:i + limite])
+        if len(palavra) > limite:
+            for i in range(0, len(palavra), limite):
+                blocos.append(palavra[i:i + limite])
         else:
-            bloco_atual = linha
+            atual = palavra
 
-    if bloco_atual:
-        blocos.append(bloco_atual)
+    if atual:
+        blocos.append(atual)
 
     return blocos
 
 
 def traduzir_texto_longo(texto: str, origem: str, destino: str) -> str:
-    """Traduz textos de qualquer tamanho, dividindo em blocos quando necessário
-    e remontando o resultado preservando a estrutura de linhas original."""
-    blocos = dividir_texto_em_blocos(texto)
+    """Traduz o texto parágrafo a parágrafo e remonta com o mesmo
+    separador ("\\n\\n"), preservando a estrutura de parágrafos e itens de
+    lista sem depender do tradutor manter quebras de linha em blocos
+    grandes de texto."""
+    paragrafos = dividir_em_paragrafos(texto)
+
+    if not paragrafos:
+        return ""
+
     traduzidos = []
+    for paragrafo in paragrafos:
+        blocos = _dividir_paragrafo_longo(paragrafo, LIMITE_CHARS_TRADUCAO)
+        partes_traduzidas = [traduzir_com_retry(bloco, origem, destino) for bloco in blocos]
+        traduzidos.append(" ".join(partes_traduzidas))
 
-    for bloco in blocos:
-        if not bloco.strip():
-            traduzidos.append(bloco)
-            continue
-        traduzidos.append(traduzir_com_retry(bloco, origem, destino))
-
-    return "\n".join(traduzidos)
+    return "\n\n".join(traduzidos)
 
 
 # Nome interno usado para a fonte Unicode registrada no reportlab
@@ -370,7 +415,7 @@ _FONTE_PDF_RESOLVIDA: Optional[str] = None
 
 
 def _localizar_arquivo_fonte_dejavu() -> Optional[str]:
-    
+   
     candidatos = []
 
     caminho_env = os.environ.get("DEJAVU_FONT_PATH")
@@ -402,7 +447,7 @@ def _localizar_arquivo_fonte_dejavu() -> Optional[str]:
 
 
 def _resolver_fonte_pdf() -> str:
-   
+
     global _FONTE_PDF_RESOLVIDA
 
     if _FONTE_PDF_RESOLVIDA:
@@ -423,22 +468,29 @@ def _resolver_fonte_pdf() -> str:
 
 
 def gerar_pdf_traduzido(texto: str) -> bytes:
-  
+    
     buffer = BytesIO()
     documento_pdf = SimpleDocTemplate(buffer, pagesize=A4)
 
-    estilo = getSampleStyleSheet()["Normal"]
-    estilo.fontName = _resolver_fonte_pdf()
+    estilo_normal = getSampleStyleSheet()["Normal"]
+    estilo_normal.fontName = _resolver_fonte_pdf()
+
+    estilo_lista = ParagraphStyle(
+        "ItemLista",
+        parent=estilo_normal,
+        leftIndent=14,
+        bulletIndent=0,
+        spaceAfter=4,
+    )
 
     elementos = []
-    for linha in texto.split("\n"):
-        if linha.strip():
-            elementos.append(Paragraph(escapar_xml(linha), estilo))
-        else:
-            elementos.append(Spacer(1, 12))
+    for paragrafo in dividir_em_paragrafos(texto):
+        estilo = estilo_lista if _PADRAO_MARCADOR_LISTA.match(paragrafo) else estilo_normal
+        elementos.append(Paragraph(escapar_xml(paragrafo), estilo))
+        elementos.append(Spacer(1, 8))
 
     if not elementos:
-        elementos.append(Paragraph("", estilo))
+        elementos.append(Paragraph("", estilo_normal))
 
     documento_pdf.build(elementos)
     buffer.seek(0)
@@ -448,8 +500,16 @@ def gerar_pdf_traduzido(texto: str) -> bytes:
 def gerar_docx_traduzido(texto: str) -> bytes:
     
     documento = DocxDocument()
-    for linha in texto.split("\n"):
-        documento.add_paragraph(linha)
+
+    for paragrafo in dividir_em_paragrafos(texto):
+        if _PADRAO_MARCADOR_LISTA.match(paragrafo):
+            texto_item = _PADRAO_MARCADOR_LISTA.sub("", paragrafo, count=1)
+            try:
+                documento.add_paragraph(texto_item, style="List Bullet")
+            except KeyError:
+                documento.add_paragraph(paragrafo)
+        else:
+            documento.add_paragraph(paragrafo)
 
     buffer = BytesIO()
     documento.save(buffer)
@@ -893,6 +953,7 @@ async def traduzir_documento(
                 }
             )
 
+        # formato_saida == "docx"
         docx_bytes = gerar_docx_traduzido(texto_traduzido)
         return StreamingResponse(
             BytesIO(docx_bytes),
