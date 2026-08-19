@@ -18,7 +18,7 @@ from google import genai
 from google.genai import types
 from PIL import Image
 from io import BytesIO
-from pypdf import PdfReader
+import pymupdf
 from docx import Document as DocxDocument
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -44,20 +44,27 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024     # 8 MB
 MAX_AUDIO_BYTES = 15 * 1024 * 1024    # 15 MB
 MAX_DOCUMENT_BYTES = 20 * 1024 * 1024  # 20 MB
 
-
+# Extensões de documento aceitas em /traduzir-documento
 EXTENSOES_DOCUMENTO_VALIDAS = {"pdf", "txt", "docx"}
 
+# Formatos de saída aceitos em /traduzir-documento
 FORMATOS_SAIDA_VALIDOS = {"texto", "pdf", "docx"}
 
 # Tamanho máximo de bloco de texto enviado por vez ao tradutor
+# (abaixo do limite prático do Google Translate, para evitar erros
+# com documentos longos).
 LIMITE_CHARS_TRADUCAO = 4500
 
+# Rate limit da rota /traduzir-documento: ela não exige autenticação e é
+# cara (parsing de arquivo + chamadas a serviço de tradução externo), então
 # limitamos quantas requisições um mesmo cliente pode fazer por janela de
 # tempo, para conter abuso/flood do mesmo arquivo (ou de arquivos diferentes).
 RATE_LIMIT_DOCUMENTO_MAX_REQUISICOES = 5
 RATE_LIMIT_DOCUMENTO_JANELA_SEGUNDOS = 60
 
-
+# TTL do cache de tradução de documentos: evita retraduzir o mesmo texto
+# quando o usuário baixa o mesmo documento em formatos de saída diferentes
+# (texto, depois PDF, depois DOCX) em sequência.
 CACHE_TRADUCAO_DOCUMENTO_TTL_SEGUNDOS = 15 * 60
 CACHE_TRADUCAO_DOCUMENTO_MAX_ENTRADAS = 500
 
@@ -184,6 +191,17 @@ def validar_tamanho(contents: bytes, limite: int, tipo: str):
             detail=f"Arquivo de {tipo} excede o tamanho máximo permitido"
         )
 
+
+# --- Rate limit da rota /traduzir-documento ---------------------------------
+#
+# Implementação em memória (janela deslizante por identificador, ex: IP do
+# cliente). Adequada para uma única instância/processo do backend. Se a
+# aplicação rodar com múltiplos workers/instâncias, o limite não é
+# compartilhado entre eles — nesse cenário, mover isso para um armazenamento
+# compartilhado (ex: Redis com INCR + EXPIRE) garante o limite de forma
+# global, mas o volume de tradução de documentos costuma ser baixo o
+# suficiente para essa versão simples resolver o abuso mais comum.
+
 _rate_limit_lock = threading.Lock()
 _rate_limit_registros: dict[str, deque] = defaultdict(deque)
 
@@ -213,6 +231,13 @@ def verificar_rate_limit_documento(identificador: str) -> None:
 
         registros.append(agora)
 
+
+# --- Cache de tradução de documentos -----------------------------------------
+#
+# Evita retraduzir o mesmo texto quando o usuário pede o mesmo documento em
+# formatos de saída diferentes (ex: primeiro em texto, depois em PDF, depois
+# em DOCX). A chave é um hash do texto extraído + idiomas, não do arquivo em
+# si, então funciona mesmo que o nome do arquivo mude.
 
 _cache_traducao_documento_lock = threading.Lock()
 _cache_traducao_documento: dict[str, tuple[str, float]] = {}
@@ -264,8 +289,28 @@ def extrair_extensao(nome_arquivo: Optional[str]) -> str:
 _PADRAO_MARCADOR_LISTA = re.compile(r"^\s*([-•*]|\d+[.)])\s+")
 
 
-def reconstruir_paragrafos(texto: str) -> str:
-   
+_PADRAO_CAMPO_ROTULADO = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ][\wÀ-ÖØ-öø-ÿ .\-]{1,25}:\s")
+_ESPACO_LARGURA_ZERO = "\u200b"
+
+
+def _normalizar_linha_pdf(linha: str) -> str:
+    return linha.replace(_ESPACO_LARGURA_ZERO, "").strip()
+
+
+def reconstruir_bloco_pdf(bloco: str) -> list[str]:
+    """Processa um bloco de texto já isolado pelo PyMuPDF (por posição no
+    layout da página) e devolve uma lista de parágrafos/itens.
+
+    Dentro de um bloco, linhas consecutivas são fundidas em um único
+    parágrafo de texto corrido — necessário porque um parágrafo justificado
+    ainda quebra uma linha a cada linha visual dentro do bloco. Duas
+    exceções ficam cada uma em sua própria linha, sem ser fundidas com a
+    vizinha:
+    - Itens de lista (-, •, *, "1.", "2)"...)
+    - Campos no formato "Rótulo: valor" (ex: "Email:", "Telefone:",
+      "LinkedIn:"), comuns em cabeçalhos de currículo e que ficam todos no
+      mesmo bloco de texto mas devem continuar em linhas separadas.
+    """
     paragrafos: list[str] = []
     atual = ""
 
@@ -275,23 +320,23 @@ def reconstruir_paragrafos(texto: str) -> str:
             paragrafos.append(atual.strip())
         atual = ""
 
-    for linha in texto.split("\n"):
-        linha_limpa = linha.strip()
+    for linha_bruta in bloco.split("\n"):
+        linha = _normalizar_linha_pdf(linha_bruta)
 
-        if not linha_limpa:
+        if not linha:
             fechar_paragrafo_atual()
             continue
 
-        if _PADRAO_MARCADOR_LISTA.match(linha_limpa):
+        if _PADRAO_MARCADOR_LISTA.match(linha) or _PADRAO_CAMPO_ROTULADO.match(linha):
             fechar_paragrafo_atual()
-            paragrafos.append(linha_limpa)
+            paragrafos.append(linha)
             continue
 
-        atual = f"{atual} {linha_limpa}".strip() if atual else linha_limpa
+        atual = f"{atual} {linha}".strip() if atual else linha
 
     fechar_paragrafo_atual()
 
-    return "\n\n".join(paragrafos)
+    return paragrafos
 
 
 def extrair_texto_txt(contents: bytes) -> str:
@@ -306,24 +351,52 @@ def extrair_texto_txt(contents: bytes) -> str:
     if texto is None:
         raise HTTPException(status_code=400, detail="Não foi possível ler a codificação do arquivo TXT")
 
+    # Um .txt não sofre do problema de quebra de linha "visual" que o PDF
+    # tem, então preservamos cada linha do arquivo como o autor escreveu,
+    # apenas alinhando ao separador de parágrafo usado pelo resto do fluxo.
     return "\n\n".join(texto.split("\n"))
 
 
 def extrair_texto_pdf(contents: bytes) -> str:
+    """Extrai o texto do PDF por blocos de layout (posição na página),
+    usando PyMuPDF em vez de uma extração linear caractere a caractere.
+
+    Isso importa especialmente para texto justificado: uma extração
+    linear simples (como a do pypdf) pode inserir uma quebra de linha
+    a cada palavra em parágrafos justificados, tornando impossível
+    diferenciar "fim de frase" de "só mais uma palavra na mesma linha".
+    Extraindo por blocos de posição, cada bloco já corresponde a uma
+    unidade visual coerente do documento (um parágrafo, um cabeçalho, um
+    grupo de campos de contato, um item de lista), o que preserva a
+    estrutura de forma bem mais confiável.
+    """
     try:
-        leitor = PdfReader(BytesIO(contents))
+        documento_pdf = pymupdf.open(stream=contents, filetype="pdf")
     except Exception:
         raise HTTPException(status_code=400, detail="Arquivo PDF inválido")
 
-    if getattr(leitor, "is_encrypted", False):
+    if documento_pdf.is_encrypted:
+        documento_pdf.close()
         raise HTTPException(status_code=400, detail="Arquivo PDF protegido por senha não é suportado")
 
     try:
-        texto_bruto = "\n".join(pagina.extract_text() or "" for pagina in leitor.pages)
+        paragrafos: list[str] = []
+        for pagina in documento_pdf:
+            blocos = pagina.get_text("blocks")
+            # Ordena por posição vertical e depois horizontal, para seguir
+            # a ordem natural de leitura mesmo em layouts com mais de uma
+            # coluna.
+            blocos.sort(key=lambda b: (round(b[1], 1), round(b[0], 1)))
+            for bloco in blocos:
+                paragrafos.extend(reconstruir_bloco_pdf(bloco[4]))
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=400, detail="Não foi possível extrair texto do PDF")
+    finally:
+        documento_pdf.close()
 
-    return reconstruir_paragrafos(texto_bruto)
+    return "\n\n".join(paragrafos)
 
 
 def extrair_texto_docx(contents: bytes) -> str:
@@ -334,13 +407,16 @@ def extrair_texto_docx(contents: bytes) -> str:
 
     partes = [paragrafo.text for paragrafo in documento.paragraphs]
 
-    
+    # Também extrai texto de dentro de tabelas, comum em documentos formatados.
     for tabela in documento.tables:
         for linha in tabela.rows:
             for celula in linha.cells:
                 if celula.text.strip():
                     partes.append(celula.text)
 
+    # Cada parágrafo do Word já é uma unidade lógica própria (o DOCX não
+    # sofre da quebra de linha visual que o PDF tem), então basta separar
+    # cada um com uma linha em branco.
     return "\n\n".join(p for p in partes if p.strip())
 
 
@@ -355,10 +431,14 @@ def extrair_texto_documento(contents: bytes, extensao: str) -> str:
 
 
 def dividir_em_paragrafos(texto: str) -> list[str]:
+    """Divide o texto em parágrafos usando linha em branco dupla como
+    separador (convenção usada pelas funções de extração acima)."""
     return [p.strip() for p in texto.split("\n\n") if p.strip()]
 
 
 def _dividir_paragrafo_longo(paragrafo: str, limite: int) -> list[str]:
+    """Fallback para um parágrafo maior que o limite do tradutor: corta por
+    palavras, sem quebrar uma palavra no meio."""
     if len(paragrafo) <= limite:
         return [paragrafo]
 
@@ -377,6 +457,7 @@ def _dividir_paragrafo_longo(paragrafo: str, limite: int) -> list[str]:
             atual = ""
 
         if len(palavra) > limite:
+            # Palavra isolada maior que o limite: corta em pedaços fixos.
             for i in range(0, len(palavra), limite):
                 blocos.append(palavra[i:i + limite])
         else:
@@ -415,7 +496,16 @@ _FONTE_PDF_RESOLVIDA: Optional[str] = None
 
 
 def _localizar_arquivo_fonte_dejavu() -> Optional[str]:
-   
+    """Procura um .ttf da DejaVu Sans em locais plausíveis do ambiente.
+
+    Ordem de busca:
+    1. Variável de ambiente DEJAVU_FONT_PATH (permite apontar explicitamente
+       para o arquivo em produção, ex: via Docker/volume).
+    2. Pasta 'fonts/' ao lado deste arquivo (fonte pode ser versionada no repo).
+    3. Fonte que já vem junto com o matplotlib, se instalado (truque comum,
+       já que o matplotlib empacota DejaVuSans.ttf para seus próprios gráficos).
+    4. Caminhos comuns de instalação no Linux/Debian/Ubuntu.
+    """
     candidatos = []
 
     caminho_env = os.environ.get("DEJAVU_FONT_PATH")
@@ -447,7 +537,10 @@ def _localizar_arquivo_fonte_dejavu() -> Optional[str]:
 
 
 def _resolver_fonte_pdf() -> str:
-
+    """Registra a fonte Unicode no reportlab (uma única vez) e retorna o
+    nome da fonte a ser usada nos parágrafos do PDF. Se nenhuma fonte com
+    suporte Unicode amplo for encontrada, cai para a Helvetica padrão do
+    reportlab, que só cobre bem caracteres latinos."""
     global _FONTE_PDF_RESOLVIDA
 
     if _FONTE_PDF_RESOLVIDA:
@@ -468,7 +561,17 @@ def _resolver_fonte_pdf() -> str:
 
 
 def gerar_pdf_traduzido(texto: str) -> bytes:
-    
+    """Gera um PDF simples contendo o texto traduzido, um parágrafo por bloco.
+
+    Usa uma fonte TTF com suporte Unicode amplo (DejaVu Sans) quando
+    disponível no ambiente, para não corromper caracteres de idiomas fora
+    do alfabeto latino (cirílico, grego, vietnamita com diacríticos, etc.).
+    Caso a fonte não seja encontrada, usa a Helvetica padrão do reportlab.
+
+    Observação: isso reconstrói o conteúdo como um documento de texto
+    simples (parágrafos e itens de lista), sem tentar reproduzir o layout
+    visual exato do arquivo original (fontes, colunas, negrito, imagens).
+    """
     buffer = BytesIO()
     documento_pdf = SimpleDocTemplate(buffer, pagesize=A4)
 
@@ -498,7 +601,13 @@ def gerar_pdf_traduzido(texto: str) -> bytes:
 
 
 def gerar_docx_traduzido(texto: str) -> bytes:
-    
+    """Gera um DOCX simples contendo o texto traduzido, um parágrafo por bloco.
+
+    Itens que começam com marcador de lista (-, •, *, "1.", "2)"...) usam o
+    estilo nativo "List Bullet" do Word, para pelo menos preservar a
+    estrutura de lista mesmo sem reproduzir o layout visual exato do
+    arquivo original.
+    """
     documento = DocxDocument()
 
     for paragrafo in dividir_em_paragrafos(texto):
@@ -507,6 +616,8 @@ def gerar_docx_traduzido(texto: str) -> bytes:
             try:
                 documento.add_paragraph(texto_item, style="List Bullet")
             except KeyError:
+                # Estilo pode não existir dependendo do template base do
+                # python-docx; nesse caso cai para parágrafo normal.
                 documento.add_paragraph(paragrafo)
         else:
             documento.add_paragraph(paragrafo)
@@ -898,9 +1009,18 @@ async def traduzir_documento(
     file: UploadFile = File(...),
     origem: str = Form(...),
     destino: str = Form(...),
-    formato_saida: str = Form(default="texto"),  
+    formato_saida: str = Form(default="texto"),  # "texto", "pdf" ou "docx"
 ):
-   
+    """Recebe um documento (PDF, TXT ou DOCX), extrai o texto, traduz para o
+    idioma de destino e devolve o resultado em texto puro ou em um novo
+    documento traduzido (PDF ou DOCX).
+
+    Esta rota não é autenticada e, propositalmente, não grava nada no
+    histórico de traduções do usuário. Para conter abuso (ex: o mesmo
+    cliente disparando várias traduções em sequência), aplica rate limit
+    por IP e reaproveita a tradução em cache quando o mesmo texto é pedido
+    de novo em outro formato de saída.
+    """
     identificador_cliente = request.client.host if request.client else "desconhecido"
     verificar_rate_limit_documento(identificador_cliente)
 
