@@ -35,45 +35,27 @@ import time
 
 router = APIRouter()
 
-# Carrega idiomas suportados
 IDIOMAS = GoogleTranslator(source='auto', target='en').get_supported_languages(as_dict=True)
 CODIGOS_VALIDOS = set(IDIOMAS.values())
 
-# Limites de upload
-MAX_IMAGE_BYTES = 8 * 1024 * 1024     # 8 MB
-MAX_AUDIO_BYTES = 15 * 1024 * 1024    # 15 MB
-MAX_DOCUMENT_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_AUDIO_BYTES = 15 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
 
-# Extensões de documento aceitas em /traduzir-documento
 EXTENSOES_DOCUMENTO_VALIDAS = {"pdf", "txt", "docx"}
 
-# Formatos de saída aceitos em /traduzir-documento
 FORMATOS_SAIDA_VALIDOS = {"texto", "pdf", "docx"}
 
-# Tamanho máximo de bloco de texto enviado por vez ao tradutor
-# (abaixo do limite prático do Google Translate, para evitar erros
-# com documentos longos).
 LIMITE_CHARS_TRADUCAO = 4500
 
-# Rate limit da rota /traduzir-documento: ela não exige autenticação e é
-# cara (parsing de arquivo + chamadas a serviço de tradução externo), então
-# limitamos quantas requisições um mesmo cliente pode fazer por janela de
-# tempo, para conter abuso/flood do mesmo arquivo (ou de arquivos diferentes).
 RATE_LIMIT_DOCUMENTO_MAX_REQUISICOES = 5
 RATE_LIMIT_DOCUMENTO_JANELA_SEGUNDOS = 60
 
-# TTL do cache de tradução de documentos: evita retraduzir o mesmo texto
-# quando o usuário baixa o mesmo documento em formatos de saída diferentes
-# (texto, depois PDF, depois DOCX) em sequência.
 CACHE_TRADUCAO_DOCUMENTO_TTL_SEGUNDOS = 15 * 60
 CACHE_TRADUCAO_DOCUMENTO_MAX_ENTRADAS = 500
 
-# Máximo de traduções mantidas no histórico de cada usuário.
-# Ao ultrapassar, as mais antigas são removidas automaticamente.
 LIMITE_HISTORICO = 100
 
-# Trechos que sugerem que o modelo saiu do papel de "OCR literal"
-# e passou a responder/executar em vez de apenas transcrever.
 MARCADORES_SUSPEITOS = [
     "```",
     "aqui está o código",
@@ -87,16 +69,12 @@ MARCADORES_SUSPEITOS = [
     "como modelo de linguagem",
 ]
 
-
-# Cliente Groq
 def get_groq_client():
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY não configurada")
     return Groq(api_key=api_key)
 
-
-# Cliente Gemini
 def get_gemini_client():
     api_key = os.environ.get("GEMINI_API_KEY")
 
@@ -108,13 +86,10 @@ def get_gemini_client():
 
     return genai.Client(api_key=api_key)
 
-
-# Cache de tradução
 @lru_cache(maxsize=1000)
 def traduzir_cache(texto: str, origem: str, destino: str):
     tradutor = GoogleTranslator(source=origem, target=destino)
     return tradutor.translate(texto)
-
 
 def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 3):
     """Tenta traduzir com pequenas re-tentativas para absorver falhas
@@ -127,14 +102,8 @@ def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 
         except Exception as e:
             ultima_excecao = e
             if tentativa < tentativas - 1:
-                time.sleep(0.4 * (tentativa + 1))  # 0.4s, 0.8s
+                time.sleep(0.4 * (tentativa + 1))
 
-    # Fallback: se a tradução com o idioma de origem informado continuar
-    # falhando mesmo após as tentativas, tenta detectar automaticamente
-    # o idioma real do texto. Cobre o caso comum de o idioma de origem
-    # selecionado não bater com o texto de fato (ex: usuário trocou de
-    # aba/modo sem ajustar o idioma, ou o texto extraído da imagem/áudio
-    # está em outro idioma).
     if origem != "auto":
         try:
             return traduzir_cache(texto, "auto", destino)
@@ -142,7 +111,6 @@ def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 
             ultima_excecao = e
 
     raise ultima_excecao
-
 
 @lru_cache(maxsize=1)
 def get_analisador_sentimento() -> SentimentIntensityAnalyzer:
@@ -153,7 +121,6 @@ def get_analisador_sentimento() -> SentimentIntensityAnalyzer:
 
     return SentimentIntensityAnalyzer()
 
-
 @lru_cache(maxsize=1000)
 def classificar_sentimento_cache(texto: str) -> str:
     """
@@ -163,7 +130,6 @@ def classificar_sentimento_cache(texto: str) -> str:
     try:
         texto_em_ingles = traduzir_com_retry(texto, "auto", "en")
     except Exception:
-        # Se a tradução falhar mesmo após as tentativas, analisa o texto original.
         texto_em_ingles = texto
 
     analisador = get_analisador_sentimento()
@@ -176,13 +142,11 @@ def classificar_sentimento_cache(texto: str) -> str:
         return "negativo"
     return "neutro"
 
-
 def validar_idiomas(origem: str, destino: str):
     """Garante que origem/destino são códigos de idioma suportados,
     evitando erros não tratados ou abuso do parâmetro."""
     if origem not in CODIGOS_VALIDOS or destino not in CODIGOS_VALIDOS:
         raise HTTPException(status_code=400, detail="Idioma não suportado")
-
 
 def validar_tamanho(contents: bytes, limite: int, tipo: str):
     if len(contents) > limite:
@@ -191,20 +155,8 @@ def validar_tamanho(contents: bytes, limite: int, tipo: str):
             detail=f"Arquivo de {tipo} excede o tamanho máximo permitido"
         )
 
-
-# --- Rate limit da rota /traduzir-documento ---------------------------------
-#
-# Implementação em memória (janela deslizante por identificador, ex: IP do
-# cliente). Adequada para uma única instância/processo do backend. Se a
-# aplicação rodar com múltiplos workers/instâncias, o limite não é
-# compartilhado entre eles — nesse cenário, mover isso para um armazenamento
-# compartilhado (ex: Redis com INCR + EXPIRE) garante o limite de forma
-# global, mas o volume de tradução de documentos costuma ser baixo o
-# suficiente para essa versão simples resolver o abuso mais comum.
-
 _rate_limit_lock = threading.Lock()
 _rate_limit_registros: dict[str, deque] = defaultdict(deque)
-
 
 def verificar_rate_limit_documento(identificador: str) -> None:
     """Bloqueia com 429 quando `identificador` (normalmente o IP do
@@ -216,7 +168,6 @@ def verificar_rate_limit_documento(identificador: str) -> None:
     with _rate_limit_lock:
         registros = _rate_limit_registros[identificador]
 
-        # Descarta registros fora da janela.
         while registros and agora - registros[0] > RATE_LIMIT_DOCUMENTO_JANELA_SEGUNDOS:
             registros.popleft()
 
@@ -231,22 +182,12 @@ def verificar_rate_limit_documento(identificador: str) -> None:
 
         registros.append(agora)
 
-
-# --- Cache de tradução de documentos -----------------------------------------
-#
-# Evita retraduzir o mesmo texto quando o usuário pede o mesmo documento em
-# formatos de saída diferentes (ex: primeiro em texto, depois em PDF, depois
-# em DOCX). A chave é um hash do texto extraído + idiomas, não do arquivo em
-# si, então funciona mesmo que o nome do arquivo mude.
-
 _cache_traducao_documento_lock = threading.Lock()
 _cache_traducao_documento: dict[str, tuple[str, float]] = {}
-
 
 def _chave_cache_traducao_documento(texto: str, origem: str, destino: str) -> str:
     bruto = f"{origem}:{destino}:{texto}".encode("utf-8")
     return hashlib.sha256(bruto).hexdigest()
-
 
 def obter_traducao_documento_cache(texto: str, origem: str, destino: str) -> Optional[str]:
     chave = _chave_cache_traducao_documento(texto, origem, destino)
@@ -264,14 +205,12 @@ def obter_traducao_documento_cache(texto: str, origem: str, destino: str) -> Opt
 
         return traducao
 
-
 def salvar_traducao_documento_cache(texto: str, origem: str, destino: str, traducao: str) -> None:
     chave = _chave_cache_traducao_documento(texto, origem, destino)
     expira_em = time.monotonic() + CACHE_TRADUCAO_DOCUMENTO_TTL_SEGUNDOS
 
     with _cache_traducao_documento_lock:
         if len(_cache_traducao_documento) >= CACHE_TRADUCAO_DOCUMENTO_MAX_ENTRADAS:
-            # Limpeza oportunista: remove apenas entradas já expiradas.
             agora = time.monotonic()
             expiradas = [k for k, (_, exp) in _cache_traducao_documento.items() if exp < agora]
             for k in expiradas:
@@ -279,23 +218,18 @@ def salvar_traducao_documento_cache(texto: str, origem: str, destino: str, tradu
 
         _cache_traducao_documento[chave] = (traducao, expira_em)
 
-
 def extrair_extensao(nome_arquivo: Optional[str]) -> str:
     if not nome_arquivo or "." not in nome_arquivo:
         return ""
     return nome_arquivo.rsplit(".", 1)[-1].lower()
 
-
 _PADRAO_MARCADOR_LISTA = re.compile(r"^\s*([-•*]|\d+[.)])\s+")
-
 
 _PADRAO_CAMPO_ROTULADO = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ][\wÀ-ÖØ-öø-ÿ .\-]{1,25}:\s")
 _ESPACO_LARGURA_ZERO = "\u200b"
 
-
 def _normalizar_linha_pdf(linha: str) -> str:
     return linha.replace(_ESPACO_LARGURA_ZERO, "").strip()
-
 
 def reconstruir_bloco_pdf(bloco: str) -> list[str]:
     """Processa um bloco de texto já isolado pelo PyMuPDF (por posição no
@@ -338,7 +272,6 @@ def reconstruir_bloco_pdf(bloco: str) -> list[str]:
 
     return paragrafos
 
-
 def extrair_texto_txt(contents: bytes) -> str:
     texto = None
     for encoding in ("utf-8", "utf-16", "latin-1"):
@@ -351,11 +284,7 @@ def extrair_texto_txt(contents: bytes) -> str:
     if texto is None:
         raise HTTPException(status_code=400, detail="Não foi possível ler a codificação do arquivo TXT")
 
-    # Um .txt não sofre do problema de quebra de linha "visual" que o PDF
-    # tem, então preservamos cada linha do arquivo como o autor escreveu,
-    # apenas alinhando ao separador de parágrafo usado pelo resto do fluxo.
     return "\n\n".join(texto.split("\n"))
-
 
 def extrair_texto_pdf(contents: bytes) -> str:
     """Extrai o texto do PDF por blocos de layout (posição na página),
@@ -383,9 +312,6 @@ def extrair_texto_pdf(contents: bytes) -> str:
         paragrafos: list[str] = []
         for pagina in documento_pdf:
             blocos = pagina.get_text("blocks")
-            # Ordena por posição vertical e depois horizontal, para seguir
-            # a ordem natural de leitura mesmo em layouts com mais de uma
-            # coluna.
             blocos.sort(key=lambda b: (round(b[1], 1), round(b[0], 1)))
             for bloco in blocos:
                 paragrafos.extend(reconstruir_bloco_pdf(bloco[4]))
@@ -398,7 +324,6 @@ def extrair_texto_pdf(contents: bytes) -> str:
 
     return "\n\n".join(paragrafos)
 
-
 def extrair_texto_docx(contents: bytes) -> str:
     try:
         documento = DocxDocument(BytesIO(contents))
@@ -407,18 +332,13 @@ def extrair_texto_docx(contents: bytes) -> str:
 
     partes = [paragrafo.text for paragrafo in documento.paragraphs]
 
-    # Também extrai texto de dentro de tabelas, comum em documentos formatados.
     for tabela in documento.tables:
         for linha in tabela.rows:
             for celula in linha.cells:
                 if celula.text.strip():
                     partes.append(celula.text)
 
-    # Cada parágrafo do Word já é uma unidade lógica própria (o DOCX não
-    # sofre da quebra de linha visual que o PDF tem), então basta separar
-    # cada um com uma linha em branco.
     return "\n\n".join(p for p in partes if p.strip())
-
 
 def extrair_texto_documento(contents: bytes, extensao: str) -> str:
     if extensao == "txt":
@@ -429,12 +349,10 @@ def extrair_texto_documento(contents: bytes, extensao: str) -> str:
         return extrair_texto_docx(contents)
     raise HTTPException(status_code=400, detail="Formato de arquivo não suportado. Envie PDF, TXT ou DOCX")
 
-
 def dividir_em_paragrafos(texto: str) -> list[str]:
     """Divide o texto em parágrafos usando linha em branco dupla como
     separador (convenção usada pelas funções de extração acima)."""
     return [p.strip() for p in texto.split("\n\n") if p.strip()]
-
 
 def _dividir_paragrafo_longo(paragrafo: str, limite: int) -> list[str]:
     """Fallback para um parágrafo maior que o limite do tradutor: corta por
@@ -457,7 +375,6 @@ def _dividir_paragrafo_longo(paragrafo: str, limite: int) -> list[str]:
             atual = ""
 
         if len(palavra) > limite:
-            # Palavra isolada maior que o limite: corta em pedaços fixos.
             for i in range(0, len(palavra), limite):
                 blocos.append(palavra[i:i + limite])
         else:
@@ -467,7 +384,6 @@ def _dividir_paragrafo_longo(paragrafo: str, limite: int) -> list[str]:
         blocos.append(atual)
 
     return blocos
-
 
 def traduzir_texto_longo(texto: str, origem: str, destino: str) -> str:
     """Traduz o texto parágrafo a parágrafo e remonta com o mesmo
@@ -487,13 +403,9 @@ def traduzir_texto_longo(texto: str, origem: str, destino: str) -> str:
 
     return "\n\n".join(traduzidos)
 
-
-# Nome interno usado para a fonte Unicode registrada no reportlab
 FONTE_UNICODE_NOME = "DejaVuSans"
 
-# Cache simples: evita tentar localizar/registrar a fonte a cada requisição
 _FONTE_PDF_RESOLVIDA: Optional[str] = None
-
 
 def _localizar_arquivo_fonte_dejavu() -> Optional[str]:
     """Procura um .ttf da DejaVu Sans em locais plausíveis do ambiente.
@@ -535,7 +447,6 @@ def _localizar_arquivo_fonte_dejavu() -> Optional[str]:
 
     return None
 
-
 def _resolver_fonte_pdf() -> str:
     """Registra a fonte Unicode no reportlab (uma única vez) e retorna o
     nome da fonte a ser usada nos parágrafos do PDF. Se nenhuma fonte com
@@ -558,7 +469,6 @@ def _resolver_fonte_pdf() -> str:
 
     _FONTE_PDF_RESOLVIDA = "Helvetica"
     return _FONTE_PDF_RESOLVIDA
-
 
 def gerar_pdf_traduzido(texto: str) -> bytes:
     """Gera um PDF simples contendo o texto traduzido, um parágrafo por bloco.
@@ -599,7 +509,6 @@ def gerar_pdf_traduzido(texto: str) -> bytes:
     buffer.seek(0)
     return buffer.getvalue()
 
-
 def gerar_docx_traduzido(texto: str) -> bytes:
     """Gera um DOCX simples contendo o texto traduzido, um parágrafo por bloco.
 
@@ -616,8 +525,6 @@ def gerar_docx_traduzido(texto: str) -> bytes:
             try:
                 documento.add_paragraph(texto_item, style="List Bullet")
             except KeyError:
-                # Estilo pode não existir dependendo do template base do
-                # python-docx; nesse caso cai para parágrafo normal.
                 documento.add_paragraph(paragrafo)
         else:
             documento.add_paragraph(paragrafo)
@@ -627,14 +534,12 @@ def gerar_docx_traduzido(texto: str) -> bytes:
     buffer.seek(0)
     return buffer.getvalue()
 
-
 def contem_conteudo_suspeito(texto: str) -> bool:
     """Heurística simples para detectar quando a saída do OCR
     parece ser uma resposta gerada pelo modelo (ex: obedeceu a uma
     instrução escondida na imagem) em vez de um texto extraído."""
     texto_lower = texto.lower()
     return any(marcador in texto_lower for marcador in MARCADORES_SUSPEITOS)
-
 
 def limitar_historico(db: Session, usuario_id: int, limite: int = LIMITE_HISTORICO) -> None:
     """Mantém apenas as `limite` traduções mais recentes do usuário,
@@ -660,7 +565,6 @@ def limitar_historico(db: Session, usuario_id: int, limite: int = LIMITE_HISTORI
             .filter(Traducao.id.in_(ids_antigos))\
             .delete(synchronize_session=False)
         db.commit()
-
 
 def registrar_traducao(
     db: Session,
@@ -689,7 +593,6 @@ def registrar_traducao(
         texto_normalizado = texto.strip()
         traducao_normalizada = traducao.strip()
 
-        # Evita duplicar quando já existe uma tradução idêntica no histórico do usuário, não importa quando foi feita.
         existente = (
             db.query(Traducao)
             .filter(
@@ -726,7 +629,6 @@ def registrar_traducao(
         traceback.print_exc()
         return None
 
-
 @router.post("/traduzir")
 def traduzir(
     request: TraducaoRequest,
@@ -758,7 +660,6 @@ def traduzir(
         "traducao": texto_traduzido
     }
 
-
 @router.post("/analisar-sentimento")
 def analisar_sentimento(request: SentimentoRequest):
     texto = request.texto.strip()
@@ -773,11 +674,9 @@ def analisar_sentimento(request: SentimentoRequest):
 
     return {"sentimento": sentimento}
 
-
 @router.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
-
 
 @router.get("/estatisticas/hoje")
 def estatisticas_hoje(usuario: Usuario = Depends(get_usuario_atual), db: Session = Depends(get_db)):
@@ -797,7 +696,6 @@ def estatisticas_hoje(usuario: Usuario = Depends(get_usuario_atual), db: Session
 
     return {"total": total, "modalidades": modalidades}
 
-
 @router.get("/historico")
 def historico(limit: int = LIMITE_HISTORICO, usuario: Usuario = Depends(get_usuario_atual), db: Session = Depends(get_db)):
     return (
@@ -807,7 +705,6 @@ def historico(limit: int = LIMITE_HISTORICO, usuario: Usuario = Depends(get_usua
         .limit(limit)
         .all()
     )
-
 
 @router.delete("/historico/{traducao_id}")
 def deletar_traducao(traducao_id: int, usuario: Usuario = Depends(get_usuario_atual), db: Session = Depends(get_db)):
@@ -855,14 +752,11 @@ async def traduzir_imagem(
         except Exception:
             raise HTTPException(status_code=400, detail="Arquivo de imagem inválido")
 
-        # Remove transparência/modos incompatíveis com JPEG
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Reduz tamanho mantendo proporção
         image.thumbnail((1600, 1600))
 
-        # Converte novamente para bytes
         buffer = BytesIO()
         image.save(
             buffer,
@@ -951,7 +845,6 @@ async def traduzir_imagem(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.post("/traduzir-voz")
 async def traduzir_voz(
     file: UploadFile = File(...),
@@ -966,7 +859,6 @@ async def traduzir_voz(
         contents = await file.read()
         validar_tamanho(contents, MAX_AUDIO_BYTES, "áudio")
 
-        # Transcrição com Groq Whisper
         client = get_groq_client()
         transcricao = client.audio.transcriptions.create(
             file=("audio.webm", contents, "audio/webm"),
@@ -1002,14 +894,13 @@ async def traduzir_voz(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.post("/traduzir-documento")
 async def traduzir_documento(
     request: Request,
     file: UploadFile = File(...),
     origem: str = Form(...),
     destino: str = Form(...),
-    formato_saida: str = Form(default="texto"),  # "texto", "pdf" ou "docx"
+    formato_saida: str = Form(default="texto"),
 ):
     """Recebe um documento (PDF, TXT ou DOCX), extrai o texto, traduz para o
     idioma de destino e devolve o resultado em texto puro ou em um novo
@@ -1073,7 +964,6 @@ async def traduzir_documento(
                 }
             )
 
-        # formato_saida == "docx"
         docx_bytes = gerar_docx_traduzido(texto_traduzido)
         return StreamingResponse(
             BytesIO(docx_bytes),
