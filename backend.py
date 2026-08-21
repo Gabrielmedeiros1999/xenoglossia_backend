@@ -6,9 +6,14 @@ from routes_auth import router_auth
 
 app = FastAPI(title="Tradutor API")
 
+origins = [
+    "http://localhost:5173",
+    "https://frontend-xenoglossia.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -18,8 +23,6 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
-    
-
 
 app.include_router(router)
 app.include_router(router_auth)
