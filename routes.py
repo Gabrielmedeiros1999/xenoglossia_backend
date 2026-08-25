@@ -2,7 +2,8 @@ from fastapi import APIRouter, HTTPException, Depends, Header, Request, UploadFi
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator.constants import GOOGLE_LANGUAGES_TO_CODES, MY_MEMORY_LANGUAGES_TO_CODES
 from functools import lru_cache
 from collections import defaultdict, deque
 from database import get_db
@@ -35,8 +36,25 @@ import time
 
 router = APIRouter()
 
-IDIOMAS = GoogleTranslator(source='auto', target='en').get_supported_languages(as_dict=True)
+IDIOMAS = GOOGLE_LANGUAGES_TO_CODES
 CODIGOS_VALIDOS = set(IDIOMAS.values())
+
+_CODIGO_PARA_MYMEMORY: dict[str, str] = {
+    codigo: MY_MEMORY_LANGUAGES_TO_CODES[nome]
+    for nome, codigo in GOOGLE_LANGUAGES_TO_CODES.items()
+    if nome in MY_MEMORY_LANGUAGES_TO_CODES
+}
+
+def _codigo_mymemory(codigo: str) -> str:
+    """Converte um código no formato usado pelo app ('pt', 'en', 'auto') para
+    o formato esperado pela API do MyMemory ('pt-PT', 'en-GB'...). Idiomas sem
+    correspondência direta caem de volta no próprio código original."""
+    if codigo == "auto":
+        return "auto"
+    return _CODIGO_PARA_MYMEMORY.get(codigo, codigo)
+
+
+MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_AUDIO_BYTES = 15 * 1024 * 1024
@@ -46,7 +64,7 @@ EXTENSOES_DOCUMENTO_VALIDAS = {"pdf", "txt", "docx"}
 
 FORMATOS_SAIDA_VALIDOS = {"texto", "pdf", "docx"}
 
-LIMITE_CHARS_TRADUCAO = 4500
+LIMITE_CHARS_TRADUCAO = 480 
 
 RATE_LIMIT_DOCUMENTO_MAX_REQUISICOES = 5
 RATE_LIMIT_DOCUMENTO_JANELA_SEGUNDOS = 60
@@ -88,12 +106,35 @@ def get_gemini_client():
 
 @lru_cache(maxsize=1000)
 def traduzir_cache(texto: str, origem: str, destino: str):
-    tradutor = GoogleTranslator(source=origem, target=destino)
-    return tradutor.translate(texto)
+    """Tenta traduzir pelo Google primeiro (melhor qualidade, sem limite de
+    caracteres tão apertado); se o Google falhar (fora do ar, bloqueio,
+    instabilidade do scraping), cai automaticamente pro MyMemory."""
+    kwargs_mymemory = {"email": MYMEMORY_EMAIL} if MYMEMORY_EMAIL else {}
+
+    engines = [
+        lambda: GoogleTranslator(source=origem, target=destino).translate(texto),
+        lambda: MyMemoryTranslator(
+            source=_codigo_mymemory(origem),
+            target=_codigo_mymemory(destino),
+            **kwargs_mymemory,
+        ).translate(texto),
+    ]
+
+    ultimo_erro: Optional[Exception] = None
+    for engine in engines:
+        try:
+            return engine()
+        except Exception as e:
+            ultimo_erro = e
+            continue
+
+    raise ultimo_erro
 
 def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 3):
     """Tenta traduzir com pequenas re-tentativas para absorver falhas
-    passageiras do deep-translator (timeout, instabilidade do Google, etc)."""
+    passageiras (timeout, instabilidade momentânea). traduzir_cache já cai do
+    Google pro MyMemory sozinho quando o Google falha; esse retry aqui cobre
+    o caso dos dois motores falharem juntos por instabilidade passageira."""
     ultima_excecao = None
 
     for tentativa in range(tentativas):
@@ -125,10 +166,10 @@ def get_analisador_sentimento() -> SentimentIntensityAnalyzer:
 def classificar_sentimento_cache(texto: str) -> str:
     """
     VADER só entende inglês, então traduzimos o texto antes de
-    analisar — reaproveitando o mesmo GoogleTranslator já usado
+    analisar — reaproveitando o mesmo tradutor já usado
     no restante do projeto, sem depender de modelos pesados."""
     try:
-        texto_em_ingles = traduzir_com_retry(texto, "auto", "en")
+        texto_em_ingles = traduzir_texto_longo(texto, "auto", "en")
     except Exception:
         texto_em_ingles = texto
 
@@ -638,7 +679,7 @@ def traduzir(
     validar_idiomas(request.origem, request.destino)
 
     try:
-        texto_traduzido = traduzir_com_retry(
+        texto_traduzido = traduzir_texto_longo(
             request.texto.strip(),
             request.origem,
             request.destino
@@ -823,7 +864,7 @@ async def traduzir_imagem(
                 detail="Não foi possível extrair o texto da imagem com segurança"
             )
 
-        traducao = traduzir_com_retry(texto_extraido, origem, destino)
+        traducao = traduzir_texto_longo(texto_extraido, origem, destino)
 
         registro_id = registrar_traducao(
             db, authorization,
@@ -872,7 +913,7 @@ async def traduzir_voz(
         if not texto_transcrito:
             raise HTTPException(status_code=400, detail="Nenhuma fala detectada no áudio")
 
-        traducao = traduzir_com_retry(texto_transcrito, origem, destino)
+        traducao = traduzir_texto_longo(texto_transcrito, origem, destino)
 
         registro_id = registrar_traducao(
             db, authorization,
