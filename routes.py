@@ -108,16 +108,34 @@ def get_gemini_client():
 
     return genai.Client(api_key=api_key)
 
+# Trechos que aparecem na página de erro genérica do Google (ex: quando o
+# scraping do translate.google.com cai numa página de erro 5xx e o parser do
+# deep_translator, sem achar o elemento esperado, acaba devolvendo o texto
+# dessa página como se fosse "a tradução").
+_MARCADORES_ERRO_GOOGLE = (
+    "that's an error",
+    "that's all we know",
+    "error 500",
+    "error 503",
+    "server error",
+)
+
+def _resultado_valido(resultado: Optional[str]) -> bool:
+    if not resultado or not resultado.strip():
+        return False
+    resultado_lower = resultado.lower()
+    return not any(marcador in resultado_lower for marcador in _MARCADORES_ERRO_GOOGLE)
+
 @lru_cache(maxsize=1000)
 def traduzir_cache(texto: str, origem: str, destino: str):
     """Tenta traduzir pelo Google primeiro (melhor qualidade, sem limite de
     caracteres tão apertado); se o Google falhar (fora do ar, bloqueio,
     instabilidade do scraping) cai automaticamente pro MyMemory.
 
-    Importante: o scraping do Google às vezes "falha silenciosamente" — não
-    lança exceção, só devolve string vazia (comum em textos curtos quando o
-    Google está instável). Por isso resultado vazio também conta como falha
-    aqui, não só exceção."""
+    Importante: o scraping do Google pode falhar de duas formas sem lançar
+    exceção — devolvendo string vazia, ou devolvendo o texto da própria
+    página de erro do Google como se fosse a tradução. As duas contam como
+    falha aqui, não só exceção."""
     kwargs_mymemory = {"email": MYMEMORY_EMAIL} if MYMEMORY_EMAIL else {}
 
     engines = [
@@ -137,10 +155,10 @@ def traduzir_cache(texto: str, origem: str, destino: str):
             ultimo_erro = e
             continue
 
-        if resultado and resultado.strip():
+        if _resultado_valido(resultado):
             return resultado
 
-        ultimo_erro = ValueError("Motor de tradução retornou resultado vazio")
+        ultimo_erro = ValueError("Motor de tradução retornou resultado inválido (vazio ou página de erro)")
 
     raise ultimo_erro
 
