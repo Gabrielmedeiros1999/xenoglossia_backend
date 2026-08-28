@@ -39,6 +39,9 @@ router = APIRouter()
 IDIOMAS = GOOGLE_LANGUAGES_TO_CODES
 CODIGOS_VALIDOS = set(IDIOMAS.values())
 
+# O MyMemory usa códigos de idioma com região (ex: 'pt-PT', 'en-GB'),
+# diferente do 'pt'/'en' que o app inteiro (e o frontend) já usa. Esse mapa
+# converte por baixo dos panos, sem exigir nenhuma mudança no contrato da API.
 _CODIGO_PARA_MYMEMORY: dict[str, str] = {
     codigo: MY_MEMORY_LANGUAGES_TO_CODES[nome]
     for nome, codigo in GOOGLE_LANGUAGES_TO_CODES.items()
@@ -53,7 +56,8 @@ def _codigo_mymemory(codigo: str) -> str:
         return "auto"
     return _CODIGO_PARA_MYMEMORY.get(codigo, codigo)
 
-
+# E-mail opcional: sem custo e sem verificação, só de informar aumenta a cota
+# diária gratuita do MyMemory de 5.000 para 50.000 caracteres/dia.
 MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -64,7 +68,7 @@ EXTENSOES_DOCUMENTO_VALIDAS = {"pdf", "txt", "docx"}
 
 FORMATOS_SAIDA_VALIDOS = {"texto", "pdf", "docx"}
 
-LIMITE_CHARS_TRADUCAO = 480 
+LIMITE_CHARS_TRADUCAO = 480  # teto do MyMemory (fallback); Google aceita bem mais, mas usamos o menor limite para o picote valer para os dois motores
 
 RATE_LIMIT_DOCUMENTO_MAX_REQUISICOES = 5
 RATE_LIMIT_DOCUMENTO_JANELA_SEGUNDOS = 60
@@ -108,7 +112,12 @@ def get_gemini_client():
 def traduzir_cache(texto: str, origem: str, destino: str):
     """Tenta traduzir pelo Google primeiro (melhor qualidade, sem limite de
     caracteres tão apertado); se o Google falhar (fora do ar, bloqueio,
-    instabilidade do scraping), cai automaticamente pro MyMemory."""
+    instabilidade do scraping) cai automaticamente pro MyMemory.
+
+    Importante: o scraping do Google às vezes "falha silenciosamente" — não
+    lança exceção, só devolve string vazia (comum em textos curtos quando o
+    Google está instável). Por isso resultado vazio também conta como falha
+    aqui, não só exceção."""
     kwargs_mymemory = {"email": MYMEMORY_EMAIL} if MYMEMORY_EMAIL else {}
 
     engines = [
@@ -123,10 +132,15 @@ def traduzir_cache(texto: str, origem: str, destino: str):
     ultimo_erro: Optional[Exception] = None
     for engine in engines:
         try:
-            return engine()
+            resultado = engine()
         except Exception as e:
             ultimo_erro = e
             continue
+
+        if resultado and resultado.strip():
+            return resultado
+
+        ultimo_erro = ValueError("Motor de tradução retornou resultado vazio")
 
     raise ultimo_erro
 
