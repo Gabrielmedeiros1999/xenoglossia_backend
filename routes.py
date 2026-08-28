@@ -3,6 +3,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from deep_translator import GoogleTranslator, MyMemoryTranslator
+from langdetect import detect as detectar_idioma, DetectorFactory, LangDetectException
+
+DetectorFactory.seed = 0  # detecção determinística (sem isso, o resultado pode variar entre execuções para textos ambíguos)
 from deep_translator.constants import GOOGLE_LANGUAGES_TO_CODES, MY_MEMORY_LANGUAGES_TO_CODES
 from functools import lru_cache
 from collections import defaultdict, deque
@@ -39,9 +42,7 @@ router = APIRouter()
 IDIOMAS = GOOGLE_LANGUAGES_TO_CODES
 CODIGOS_VALIDOS = set(IDIOMAS.values())
 
-# O MyMemory usa códigos de idioma com região (ex: 'pt-PT', 'en-GB'),
-# diferente do 'pt'/'en' que o app inteiro (e o frontend) já usa. Esse mapa
-# converte por baixo dos panos, sem exigir nenhuma mudança no contrato da API.
+
 _CODIGO_PARA_MYMEMORY: dict[str, str] = {
     codigo: MY_MEMORY_LANGUAGES_TO_CODES[nome]
     for nome, codigo in GOOGLE_LANGUAGES_TO_CODES.items()
@@ -56,8 +57,21 @@ def _codigo_mymemory(codigo: str) -> str:
         return "auto"
     return _CODIGO_PARA_MYMEMORY.get(codigo, codigo)
 
-# E-mail opcional: sem custo e sem verificação, só de informar aumenta a cota
-# diária gratuita do MyMemory de 5.000 para 50.000 caracteres/dia.
+def _origem_mymemory(origem: str, texto: str) -> str:
+    """O MyMemory (diferente do Google) não aceita 'auto' como idioma de
+    origem — ele rejeita com 'AUTO IS AN INVALID SOURCE LANGUAGE'. Quando o
+    app pede detecção automática, detectamos o idioma localmente (sem
+    depender de nenhuma API externa) e convertemos pro formato do MyMemory."""
+    if origem != "auto":
+        return _codigo_mymemory(origem)
+
+    try:
+        codigo_detectado = detectar_idioma(texto)
+    except LangDetectException:
+        codigo_detectado = "en"  
+
+    return _codigo_mymemory(codigo_detectado)
+
 MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -108,23 +122,24 @@ def get_gemini_client():
 
     return genai.Client(api_key=api_key)
 
-# Trechos que aparecem na página de erro genérica do Google (ex: quando o
-# scraping do translate.google.com cai numa página de erro 5xx e o parser do
-# deep_translator, sem achar o elemento esperado, acaba devolvendo o texto
-# dessa página como se fosse "a tradução").
-_MARCADORES_ERRO_GOOGLE = (
+
+_MARCADORES_ERRO_TRADUCAO = (
     "that's an error",
     "that's all we know",
     "error 500",
     "error 503",
     "server error",
+    "is an invalid source language",
+    "is an invalid target language",
+    "mymemory warning",
+    "please select",
 )
 
 def _resultado_valido(resultado: Optional[str]) -> bool:
     if not resultado or not resultado.strip():
         return False
     resultado_lower = resultado.lower()
-    return not any(marcador in resultado_lower for marcador in _MARCADORES_ERRO_GOOGLE)
+    return not any(marcador in resultado_lower for marcador in _MARCADORES_ERRO_TRADUCAO)
 
 @lru_cache(maxsize=1000)
 def traduzir_cache(texto: str, origem: str, destino: str):
@@ -141,7 +156,7 @@ def traduzir_cache(texto: str, origem: str, destino: str):
     engines = [
         lambda: GoogleTranslator(source=origem, target=destino).translate(texto),
         lambda: MyMemoryTranslator(
-            source=_codigo_mymemory(origem),
+            source=_origem_mymemory(origem, texto),
             target=_codigo_mymemory(destino),
             **kwargs_mymemory,
         ).translate(texto),
