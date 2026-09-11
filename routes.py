@@ -2,7 +2,8 @@ from fastapi import APIRouter, HTTPException, Depends, Header, Request, UploadFi
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator import MyMemoryTranslator
+import deepl
 from langdetect import detect as detectar_idioma, DetectorFactory, LangDetectException
 
 DetectorFactory.seed = 0  # detecção determinística (sem isso, o resultado pode variar entre execuções para textos ambíguos)
@@ -73,6 +74,74 @@ def _origem_mymemory(origem: str, texto: str) -> str:
     return _codigo_mymemory(codigo_detectado)
 
 MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")
+
+
+@lru_cache(maxsize=1)
+def get_deepl_client():
+    """Cria o cliente oficial da API DeepL uma única vez por processo."""
+    if not DEEPL_API_KEY:
+        raise RuntimeError("DEEPL_API_KEY não configurada")
+    return deepl.DeepLClient(DEEPL_API_KEY)
+
+
+def _codigo_deepl(codigo: str, destino: bool = False) -> str:
+    """Converte os códigos do app para os códigos do DeepL.
+    A origem e o destino têm pequenas diferenças no caso de alguns
+    idiomas (por exemplo, PT como origem e PT-BR como destino)."""
+    mapa_origem = {
+        "pt": "PT",
+        "en": "EN",
+        "es": "ES",
+        "fr": "FR",
+        "de": "DE",
+        "it": "IT",
+        "nl": "NL",
+        "pl": "PL",
+        "ru": "RU",
+        "ja": "JA",
+        "zh": "ZH",
+        "ko": "KO",
+        "tr": "TR",
+        "uk": "UK",
+        "cs": "CS",
+        "da": "DA",
+        "el": "EL",
+        "fi": "FI",
+        "hu": "HU",
+        "id": "ID",
+        "nb": "NB",
+        "ro": "RO",
+        "sk": "SK",
+        "sv": "SV",
+    }
+
+    mapa_destino = {
+        **mapa_origem,
+        "pt": "PT-BR",
+        "en": "EN-US",
+    }
+
+    mapa = mapa_destino if destino else mapa_origem
+    return mapa.get(codigo.lower(), codigo.upper())
+
+
+def traduzir_deepl(texto: str, origem: str, destino: str) -> str:
+    """Traduz usando a API oficial do DeepL.
+    Se a origem for 'auto', o DeepL faz a detecção automaticamente."""
+    client = get_deepl_client()
+
+    target_lang = _codigo_deepl(destino, destino=True)
+    source_lang = None if origem == "auto" else _codigo_deepl(origem)
+
+    resultado = client.translate_text(
+        texto,
+        source_lang=source_lang,
+        target_lang=target_lang,
+    )
+
+    return resultado.text
+
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_AUDIO_BYTES = 15 * 1024 * 1024
@@ -82,7 +151,7 @@ EXTENSOES_DOCUMENTO_VALIDAS = {"pdf", "txt", "docx"}
 
 FORMATOS_SAIDA_VALIDOS = {"texto", "pdf", "docx"}
 
-LIMITE_CHARS_TRADUCAO = 480  # teto do MyMemory (fallback); Google aceita bem mais, mas usamos o menor limite para o picote valer para os dois motores
+LIMITE_CHARS_TRADUCAO = 480  # limite conservador mantido para o fallback MyMemory
 
 RATE_LIMIT_DOCUMENTO_MAX_REQUISICOES = 5
 RATE_LIMIT_DOCUMENTO_JANELA_SEGUNDOS = 60
@@ -143,18 +212,16 @@ def _resultado_valido(resultado: Optional[str]) -> bool:
 
 @lru_cache(maxsize=1000)
 def traduzir_cache(texto: str, origem: str, destino: str):
-    """Tenta traduzir pelo Google primeiro (melhor qualidade, sem limite de
-    caracteres tão apertado); se o Google falhar (fora do ar, bloqueio,
-    instabilidade do scraping) cai automaticamente pro MyMemory.
+    """Usa o DeepL pela API oficial como motor principal.
+    Se o DeepL não estiver configurado, estiver indisponível ou não
+    suportar o idioma solicitado, cai automaticamente para o MyMemory.
 
-    Importante: o scraping do Google pode falhar de duas formas sem lançar
-    exceção — devolvendo string vazia, ou devolvendo o texto da própria
-    página de erro do Google como se fosse a tradução. As duas contam como
-    falha aqui, não só exceção."""
+    Diferente do GoogleTranslator do deep-translator, o DeepL usa uma
+    API oficial e não depende de scraping do site de tradução."""
     kwargs_mymemory = {"email": MYMEMORY_EMAIL} if MYMEMORY_EMAIL else {}
 
     engines = [
-        lambda: GoogleTranslator(source=origem, target=destino).translate(texto),
+        lambda: traduzir_deepl(texto, origem, destino),
         lambda: MyMemoryTranslator(
             source=_origem_mymemory(origem, texto),
             target=_codigo_mymemory(destino),
@@ -163,6 +230,7 @@ def traduzir_cache(texto: str, origem: str, destino: str):
     ]
 
     ultimo_erro: Optional[Exception] = None
+
     for engine in engines:
         try:
             resultado = engine()
@@ -173,9 +241,13 @@ def traduzir_cache(texto: str, origem: str, destino: str):
         if _resultado_valido(resultado):
             return resultado
 
-        ultimo_erro = ValueError("Motor de tradução retornou resultado inválido (vazio ou página de erro)")
+        ultimo_erro = ValueError(
+            "Motor de tradução retornou resultado inválido "
+            "(vazio ou página de erro)"
+        )
 
-    raise ultimo_erro
+    raise ultimo_erro or RuntimeError("Nenhum motor de tradução disponível")
+
 
 def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 3):
     """Tenta traduzir com pequenas re-tentativas para absorver falhas
