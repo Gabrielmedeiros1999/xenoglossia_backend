@@ -3,6 +3,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from deep_translator import MyMemoryTranslator
+try:
+    from deep_translator.exceptions import TooManyRequests as MyMemoryTooManyRequests
+except Exception:  # pragma: no cover
+    MyMemoryTooManyRequests = None
 import deepl
 from langdetect import detect as detectar_idioma, DetectorFactory, LangDetectException
 
@@ -105,9 +109,12 @@ _deepl_lock = threading.Lock()
 _deepl_indisponivel_ate = 0.0
 
 _ERROS_LIMITE_DEEPL = tuple(
-    getattr(deepl, nome)
-    for nome in ("TooManyRequestsException", "QuotaExceededException")
-    if hasattr(deepl, nome)
+    classe
+    for classe in (
+        getattr(deepl, nome, None)
+        for nome in ("TooManyRequestsException", "QuotaExceededException")
+    )
+    if isinstance(classe, type)
 )
 
 
@@ -115,10 +122,34 @@ def _deepl_disponivel() -> bool:
     return DEEPL_API_KEY is not None and time.monotonic() >= _deepl_indisponivel_ate
 
 
-def _registrar_falha_deepl(erro: Exception) -> None:
-    global _deepl_indisponivel_ate
+MYMEMORY_PAUSA_APOS_LIMITE_SEGUNDOS = 30
+_mymemory_indisponivel_ate = 0.0
 
-    print(f"[DeepL] falha: {type(erro).__name__}: {erro}", flush=True)
+# Limita chamadas simultâneas ao DeepL: melhor fazer fila do que tomar 429.
+_deepl_semaforo = threading.BoundedSemaphore(8)
+
+
+def _mymemory_disponivel() -> bool:
+    return time.monotonic() >= _mymemory_indisponivel_ate
+
+
+def _e_limite_mymemory(erro: Exception) -> bool:
+    return MyMemoryTooManyRequests is not None and isinstance(erro, MyMemoryTooManyRequests)
+
+
+def _registrar_falha_deepl(erro: Exception, motor: str = "DeepL") -> None:
+    """Loga a falha COM o nome do motor que falhou e aciona o circuit breaker
+    daquele motor quando o erro é de limite de uso."""
+    global _deepl_indisponivel_ate, _mymemory_indisponivel_ate
+
+    print(f"[{motor}] falha: {type(erro).__name__}: {erro}", flush=True)
+
+    if motor == "MyMemory":
+        if _e_limite_mymemory(erro):
+            with _deepl_lock:
+                _mymemory_indisponivel_ate = time.monotonic() + MYMEMORY_PAUSA_APOS_LIMITE_SEGUNDOS
+            print(f"[MyMemory] limite atingido: pausado por {MYMEMORY_PAUSA_APOS_LIMITE_SEGUNDOS}s", flush=True)
+        return
 
     if not _erro_e_limite(erro):
         return
@@ -196,11 +227,12 @@ def traduzir_deepl(texto: str, origem: str, destino: str) -> str:
     target_lang = _codigo_deepl(destino, destino=True)
     source_lang = None if origem == "auto" else _codigo_deepl(origem)
 
-    resultado = client.translate_text(
-        texto,
-        source_lang=source_lang,
-        target_lang=target_lang,
-    )
+    with _deepl_semaforo:
+        resultado = client.translate_text(
+            texto,
+            source_lang=source_lang,
+            target_lang=target_lang,
+        )
 
     return resultado.text
 
@@ -285,23 +317,25 @@ def traduzir_cache(texto: str, origem: str, destino: str, usar_deepl: bool = Tru
     engines = []
 
     if usar_deepl and _deepl_disponivel() and _deepl_suporta(origem, destino):
-        engines.append(lambda: traduzir_deepl(texto, origem, destino))
+        engines.append(("DeepL", lambda: traduzir_deepl(texto, origem, destino)))
 
-    engines.append(
-        lambda: MyMemoryTranslator(
-            source=_origem_mymemory(origem, texto),
-            target=_codigo_mymemory(destino),
-            **kwargs_mymemory,
-        ).translate(texto)
-    )
+    if _mymemory_disponivel():
+        engines.append((
+            "MyMemory",
+            lambda: MyMemoryTranslator(
+                source=_origem_mymemory(origem, texto),
+                target=_codigo_mymemory(destino),
+                **kwargs_mymemory,
+            ).translate(texto),
+        ))
 
     ultimo_erro: Optional[Exception] = None
 
-    for engine in engines:
+    for nome_motor, engine in engines:
         try:
             resultado = engine()
         except Exception as e:
-            _registrar_falha_deepl(e)
+            _registrar_falha_deepl(e, nome_motor)
             ultimo_erro = e
             continue
 
@@ -328,6 +362,8 @@ def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 
             return traduzir_cache(texto, origem, destino, usar_deepl)
         except Exception as e:
             ultima_excecao = e
+            if _e_limite_mymemory(e) or _erro_e_limite(e):
+                raise  # insistir em um 429 só gasta tempo e piora o limite
             if tentativa < tentativas - 1:
                 time.sleep(0.2)
 
@@ -620,7 +656,7 @@ def _dividir_paragrafo_longo(paragrafo: str, limite: int) -> list[str]:
 DEEPL_MAX_TEXTOS_POR_REQUISICAO = 50
 
 # Pool compartilhado só para o fallback (MyMemory), que exige blocos pequenos.
-_executor_fallback = ThreadPoolExecutor(max_workers=2, thread_name_prefix="traducao-fallback")
+_executor_fallback = ThreadPoolExecutor(max_workers=4, thread_name_prefix="traducao-fallback")
 
 
 DEEPL_MAX_BYTES_POR_REQUISICAO = 40_000    # lotes menores = respostas mais rápidas (limite real: 128 KiB)
@@ -671,11 +707,12 @@ def traduzir_paragrafos_deepl(paragrafos: list[str], origem: str, destino: str) 
 
     traduzidos: list[str] = []
     for lote in _montar_lotes_deepl(pedacos):
-        respostas = client.translate_text(
-            lote,
-            source_lang=source_lang,
-            target_lang=target_lang,
-        )
+        with _deepl_semaforo:
+            respostas = client.translate_text(
+                lote,
+                source_lang=source_lang,
+                target_lang=target_lang,
+            )
         if not isinstance(respostas, list):
             respostas = [respostas]
         traduzidos.extend(r.text for r in respostas)
@@ -700,6 +737,11 @@ def _traduzir_fallback_paralelo(paragrafos: list[str], origem: str, destino: str
             for bloco in blocos
         ]
         return " ".join(partes)
+
+    # Textos curtos (o caso comum) rodam direto na thread da requisição:
+    # passar pelo pool só criaria fila quando há muitos usuários.
+    if len(paragrafos) <= 2:
+        return "\n\n".join(traduzir_paragrafo(p) for p in paragrafos)
 
     return "\n\n".join(_executor_fallback.map(traduzir_paragrafo, paragrafos))
 
@@ -1022,14 +1064,11 @@ def traduzir(
 ):
     validar_idiomas(request.origem, request.destino)
 
-    try:
-        texto_traduzido = traduzir_texto_longo(
-            request.texto.strip(),
-            request.origem,
-            request.destino
-        )
-    except Exception:
-        raise HTTPException(status_code=500, detail="Erro ao traduzir texto")
+    texto_traduzido = traduzir_texto_longo_ou_http(
+        request.texto.strip(),
+        request.origem,
+        request.destino
+    )
 
     # O front (TextoTraducao.tsx) não usa o "id" desta resposta: o histórico é
     # recarregado via GET /historico. Então gravamos depois de responder.
