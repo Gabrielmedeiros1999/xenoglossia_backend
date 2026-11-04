@@ -83,27 +83,32 @@ DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")
 print(f"[DeepL] chave configurada neste ambiente: {bool(DEEPL_API_KEY)}", flush=True)
 
 
-# A biblioteca do DeepL faz até 5 retentativas internas com backoff exponencial
-# (429/5xx). Isso pode somar vários segundos no p95. Reduzimos para 1 e
-# deixamos o fallback assumir.
-try:
-    deepl.http_client.max_network_retries = 1
-    deepl.http_client.min_connection_timeout = 30.0  # lotes de documento podem demorar mais que 5 s
-except Exception:
-    pass
-
-
 @lru_cache(maxsize=1)
 def get_deepl_client():
-    """Cria o cliente oficial da API DeepL uma única vez por processo."""
+    """Cria o cliente oficial da API DeepL uma única vez por processo.
+
+    A biblioteca faz até 5 retentativas internas com backoff exponencial
+    (429/5xx), o que pode somar vários segundos no p95. Reduzimos para 1 e
+    damos 30 s de timeout (lotes de documento podem demorar mais que o padrão).
+    As versões novas da lib aceitam isso como opção do cliente; as antigas
+    usam as variáveis globais (agora deprecated)."""
     if not DEEPL_API_KEY:
         raise RuntimeError("DEEPL_API_KEY não configurada")
-    return deepl.DeepLClient(DEEPL_API_KEY)
+
+    try:
+        return deepl.DeepLClient(DEEPL_API_KEY, max_retries=1, timeout_s=30)
+    except TypeError:
+        try:
+            deepl.http_client.max_network_retries = 1
+            deepl.http_client.min_connection_timeout = 30.0
+        except Exception:
+            pass
+        return deepl.DeepLClient(DEEPL_API_KEY)
 
 
 # --- Circuit breaker: se o DeepL devolver 429 / quota excedida, paramos de
 # bater nele por alguns segundos em vez de falhar (e esperar) em toda requisição.
-DEEPL_PAUSA_APOS_LIMITE_SEGUNDOS = 30
+DEEPL_PAUSA_APOS_LIMITE_SEGUNDOS = 5
 DEEPL_PAUSA_APOS_COTA_SEGUNDOS = 60 * 60  # cota mensal esgotada só volta no próximo ciclo
 _deepl_lock = threading.Lock()
 _deepl_indisponivel_ate = 0.0
@@ -159,6 +164,8 @@ def _registrar_falha_deepl(erro: Exception, motor: str = "DeepL") -> None:
 
     with _deepl_lock:
         _deepl_indisponivel_ate = time.monotonic() + pausa
+
+    print(f"[DeepL] PAUSADO por {pausa}s após {type(erro).__name__}", flush=True)
 
     if cota_esgotada:
         print("[DeepL] COTA ESGOTADA: confira o uso em deepl.com/your-account/usage", flush=True)
