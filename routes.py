@@ -76,6 +76,7 @@ def _origem_mymemory(origem: str, texto: str) -> str:
 
 MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")
+print(f"[DeepL] chave configurada neste ambiente: {bool(DEEPL_API_KEY)}", flush=True)
 
 
 # A biblioteca do DeepL faz até 5 retentativas internas com backoff exponencial
@@ -83,7 +84,7 @@ DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")
 # deixamos o fallback assumir.
 try:
     deepl.http_client.max_network_retries = 1
-    deepl.http_client.min_connection_timeout = 5.0
+    deepl.http_client.min_connection_timeout = 30.0  # lotes de documento podem demorar mais que 5 s
 except Exception:
     pass
 
@@ -99,6 +100,7 @@ def get_deepl_client():
 # --- Circuit breaker: se o DeepL devolver 429 / quota excedida, paramos de
 # bater nele por alguns segundos em vez de falhar (e esperar) em toda requisição.
 DEEPL_PAUSA_APOS_LIMITE_SEGUNDOS = 30
+DEEPL_PAUSA_APOS_COTA_SEGUNDOS = 60 * 60  # cota mensal esgotada só volta no próximo ciclo
 _deepl_lock = threading.Lock()
 _deepl_indisponivel_ate = 0.0
 
@@ -115,9 +117,20 @@ def _deepl_disponivel() -> bool:
 
 def _registrar_falha_deepl(erro: Exception) -> None:
     global _deepl_indisponivel_ate
-    if _erro_e_limite(erro):
-        with _deepl_lock:
-            _deepl_indisponivel_ate = time.monotonic() + DEEPL_PAUSA_APOS_LIMITE_SEGUNDOS
+
+    print(f"[DeepL] falha: {type(erro).__name__}: {erro}", flush=True)
+
+    if not _erro_e_limite(erro):
+        return
+
+    cota_esgotada = type(erro).__name__ == "QuotaExceededException"
+    pausa = DEEPL_PAUSA_APOS_COTA_SEGUNDOS if cota_esgotada else DEEPL_PAUSA_APOS_LIMITE_SEGUNDOS
+
+    with _deepl_lock:
+        _deepl_indisponivel_ate = time.monotonic() + pausa
+
+    if cota_esgotada:
+        print("[DeepL] COTA ESGOTADA: confira o uso em deepl.com/your-account/usage", flush=True)
 
 
 def _erro_e_limite(erro: Exception) -> bool:
@@ -607,21 +620,57 @@ def _dividir_paragrafo_longo(paragrafo: str, limite: int) -> list[str]:
 DEEPL_MAX_TEXTOS_POR_REQUISICAO = 50
 
 # Pool compartilhado só para o fallback (MyMemory), que exige blocos pequenos.
-_executor_fallback = ThreadPoolExecutor(max_workers=8, thread_name_prefix="traducao-fallback")
+_executor_fallback = ThreadPoolExecutor(max_workers=2, thread_name_prefix="traducao-fallback")
+
+
+DEEPL_MAX_BYTES_POR_REQUISICAO = 40_000    # lotes menores = respostas mais rápidas (limite real: 128 KiB)
+DEEPL_MAX_CHARS_POR_TEXTO = 5_000          # parágrafos gigantes são cortados por palavra
+
+
+def _montar_lotes_deepl(pedacos: list[str]) -> list[list[str]]:
+    """Agrupa os textos respeitando o máximo de itens E o máximo de bytes por requisição."""
+    lotes: list[list[str]] = []
+    atual: list[str] = []
+    bytes_atual = 0
+
+    for pedaco in pedacos:
+        tamanho = len(pedaco.encode("utf-8"))
+        estoura = (
+            len(atual) >= DEEPL_MAX_TEXTOS_POR_REQUISICAO
+            or (atual and bytes_atual + tamanho > DEEPL_MAX_BYTES_POR_REQUISICAO)
+        )
+        if estoura:
+            lotes.append(atual)
+            atual, bytes_atual = [], 0
+
+        atual.append(pedaco)
+        bytes_atual += tamanho
+
+    if atual:
+        lotes.append(atual)
+
+    return lotes
 
 
 def traduzir_paragrafos_deepl(paragrafos: list[str], origem: str, destino: str) -> list[str]:
-    """Envia todos os parágrafos ao DeepL em UMA requisição (até 50 por vez),
-    em vez de uma requisição por parágrafo. O limite de 480 caracteres não se
-    aplica aqui: ele existe só por causa do MyMemory."""
+    """Envia os parágrafos ao DeepL em poucas requisições (agrupadas por
+    quantidade e tamanho), em vez de uma requisição por parágrafo. O limite de
+    480 caracteres não se aplica aqui: ele existe só por causa do MyMemory."""
     client = get_deepl_client()
 
     target_lang = _codigo_deepl(destino, destino=True)
     source_lang = None if origem == "auto" else _codigo_deepl(origem)
 
+    # Parágrafos enormes viram vários pedaços; guardamos de qual parágrafo cada um veio.
+    pedacos: list[str] = []
+    dono: list[int] = []
+    for idx, paragrafo in enumerate(paragrafos):
+        for parte in _dividir_paragrafo_longo(paragrafo, DEEPL_MAX_CHARS_POR_TEXTO):
+            pedacos.append(parte)
+            dono.append(idx)
+
     traduzidos: list[str] = []
-    for i in range(0, len(paragrafos), DEEPL_MAX_TEXTOS_POR_REQUISICAO):
-        lote = paragrafos[i:i + DEEPL_MAX_TEXTOS_POR_REQUISICAO]
+    for lote in _montar_lotes_deepl(pedacos):
         respostas = client.translate_text(
             lote,
             source_lang=source_lang,
@@ -631,7 +680,14 @@ def traduzir_paragrafos_deepl(paragrafos: list[str], origem: str, destino: str) 
             respostas = [respostas]
         traduzidos.extend(r.text for r in respostas)
 
-    return traduzidos
+    if len(traduzidos) != len(pedacos):
+        raise RuntimeError("DeepL devolveu quantidade inesperada de textos")
+
+    por_paragrafo: list[list[str]] = [[] for _ in paragrafos]
+    for idx, texto in zip(dono, traduzidos):
+        por_paragrafo[idx].append(texto)
+
+    return [" ".join(partes) for partes in por_paragrafo]
 
 
 def _traduzir_fallback_paralelo(paragrafos: list[str], origem: str, destino: str) -> str:
@@ -667,6 +723,22 @@ def _traduzir_texto_longo_cache(texto: str, origem: str, destino: str) -> str:
 
     # 2) Fallback: MyMemory, em paralelo
     return _traduzir_fallback_paralelo(paragrafos, origem, destino)
+
+
+def traduzir_texto_longo_ou_http(texto: str, origem: str, destino: str) -> str:
+    """Igual a traduzir_texto_longo, mas converte falhas em um erro 503
+    legível (e loga o erro real), em vez de expor o texto interno das bibliotecas."""
+    try:
+        return traduzir_texto_longo(texto, origem, destino)
+    except Exception as e:
+        print(f"[traducao] falha em todos os motores: {type(e).__name__}: {e}", flush=True)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Os serviços de tradução atingiram o limite de uso no momento. "
+                "Tente novamente em alguns minutos."
+            ),
+        )
 
 
 def traduzir_texto_longo(texto: str, origem: str, destino: str) -> str:
@@ -1140,7 +1212,7 @@ async def traduzir_imagem(
                 detail="Não foi possível extrair o texto da imagem com segurança"
             )
 
-        traducao = traduzir_texto_longo(texto_extraido, origem, destino)
+        traducao = traduzir_texto_longo_ou_http(texto_extraido, origem, destino)
 
         registro_id = registrar_traducao(
             db, authorization,
@@ -1191,7 +1263,7 @@ async def traduzir_voz(
         if not texto_transcrito:
             raise HTTPException(status_code=400, detail="Nenhuma fala detectada no áudio")
 
-        traducao = traduzir_texto_longo(texto_transcrito, origem, destino)
+        traducao = traduzir_texto_longo_ou_http(texto_transcrito, origem, destino)
 
         registro_id = registrar_traducao(
             db, authorization,
@@ -1265,7 +1337,7 @@ async def traduzir_documento(
 
         texto_traduzido = obter_traducao_documento_cache(texto_extraido, origem, destino)
         if texto_traduzido is None:
-            texto_traduzido = traduzir_texto_longo(texto_extraido, origem, destino)
+            texto_traduzido = traduzir_texto_longo_ou_http(texto_extraido, origem, destino)
             salvar_traducao_documento_cache(texto_extraido, origem, destino, texto_traduzido)
 
         if formato_saida == "texto":
