@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Header, Request, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Depends, Header, Request, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -10,13 +10,14 @@ DetectorFactory.seed = 0  # detecção determinística (sem isso, o resultado po
 from deep_translator.constants import GOOGLE_LANGUAGES_TO_CODES, MY_MEMORY_LANGUAGES_TO_CODES
 from functools import lru_cache
 from collections import defaultdict, deque
-from database import get_db
+from database import get_db, SessionLocal
 from models import Traducao, Usuario
 from schemas import TraducaoRequest, SentimentoRequest
 from auth import decodificar_token, get_usuario_atual
 from typing import Optional
 import hashlib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import re
 from groq import Groq
 from google import genai
@@ -77,6 +78,16 @@ MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")
 
 
+# A biblioteca do DeepL faz até 5 retentativas internas com backoff exponencial
+# (429/5xx). Isso pode somar vários segundos no p95. Reduzimos para 1 e
+# deixamos o fallback assumir.
+try:
+    deepl.http_client.max_network_retries = 1
+    deepl.http_client.min_connection_timeout = 5.0
+except Exception:
+    pass
+
+
 @lru_cache(maxsize=1)
 def get_deepl_client():
     """Cria o cliente oficial da API DeepL uma única vez por processo."""
@@ -85,36 +96,39 @@ def get_deepl_client():
     return deepl.DeepLClient(DEEPL_API_KEY)
 
 
+# --- Circuit breaker: se o DeepL devolver 429 / quota excedida, paramos de
+# bater nele por alguns segundos em vez de falhar (e esperar) em toda requisição.
+DEEPL_PAUSA_APOS_LIMITE_SEGUNDOS = 30
+_deepl_lock = threading.Lock()
+_deepl_indisponivel_ate = 0.0
+
+_ERROS_LIMITE_DEEPL = tuple(
+    getattr(deepl, nome)
+    for nome in ("TooManyRequestsException", "QuotaExceededException")
+    if hasattr(deepl, nome)
+)
+
+
+def _deepl_disponivel() -> bool:
+    return DEEPL_API_KEY is not None and time.monotonic() >= _deepl_indisponivel_ate
+
+
+def _registrar_falha_deepl(erro: Exception) -> None:
+    global _deepl_indisponivel_ate
+    if _erro_e_limite(erro):
+        with _deepl_lock:
+            _deepl_indisponivel_ate = time.monotonic() + DEEPL_PAUSA_APOS_LIMITE_SEGUNDOS
+
+
+def _erro_e_limite(erro: Exception) -> bool:
+    return bool(_ERROS_LIMITE_DEEPL) and isinstance(erro, _ERROS_LIMITE_DEEPL)
+
+
 def _codigo_deepl(codigo: str, destino: bool = False) -> str:
     """Converte os códigos do app para os códigos do DeepL.
     A origem e o destino têm pequenas diferenças no caso de alguns
     idiomas (por exemplo, PT como origem e PT-BR como destino)."""
-    mapa_origem = {
-        "pt": "PT",
-        "en": "EN",
-        "es": "ES",
-        "fr": "FR",
-        "de": "DE",
-        "it": "IT",
-        "nl": "NL",
-        "pl": "PL",
-        "ru": "RU",
-        "ja": "JA",
-        "zh": "ZH",
-        "ko": "KO",
-        "tr": "TR",
-        "uk": "UK",
-        "cs": "CS",
-        "da": "DA",
-        "el": "EL",
-        "fi": "FI",
-        "hu": "HU",
-        "id": "ID",
-        "nb": "NB",
-        "ro": "RO",
-        "sk": "SK",
-        "sv": "SV",
-    }
+    mapa_origem = _MAPA_ORIGEM_DEEPL
 
     mapa_destino = {
         **mapa_origem,
@@ -124,6 +138,41 @@ def _codigo_deepl(codigo: str, destino: bool = False) -> str:
 
     mapa = mapa_destino if destino else mapa_origem
     return mapa.get(codigo.lower(), codigo.upper())
+
+
+def _deepl_suporta(origem: str, destino: str) -> bool:
+    """Evita uma ida à rede só para o DeepL recusar um idioma que ele não tem."""
+    if destino.lower() not in _MAPA_ORIGEM_DEEPL:
+        return False
+    return origem == "auto" or origem.lower() in _MAPA_ORIGEM_DEEPL
+
+
+_MAPA_ORIGEM_DEEPL = {
+    "pt": "PT",
+    "en": "EN",
+    "es": "ES",
+    "fr": "FR",
+    "de": "DE",
+    "it": "IT",
+    "nl": "NL",
+    "pl": "PL",
+    "ru": "RU",
+    "ja": "JA",
+    "zh": "ZH",
+    "ko": "KO",
+    "tr": "TR",
+    "uk": "UK",
+    "cs": "CS",
+    "da": "DA",
+    "el": "EL",
+    "fi": "FI",
+    "hu": "HU",
+    "id": "ID",
+    "nb": "NB",
+    "ro": "RO",
+    "sk": "SK",
+    "sv": "SV",
+}
 
 
 def traduzir_deepl(texto: str, origem: str, destino: str) -> str:
@@ -211,7 +260,7 @@ def _resultado_valido(resultado: Optional[str]) -> bool:
     return not any(marcador in resultado_lower for marcador in _MARCADORES_ERRO_TRADUCAO)
 
 @lru_cache(maxsize=1000)
-def traduzir_cache(texto: str, origem: str, destino: str):
+def traduzir_cache(texto: str, origem: str, destino: str, usar_deepl: bool = True):
     """Usa o DeepL pela API oficial como motor principal.
     Se o DeepL não estiver configurado, estiver indisponível ou não
     suportar o idioma solicitado, cai automaticamente para o MyMemory.
@@ -220,14 +269,18 @@ def traduzir_cache(texto: str, origem: str, destino: str):
     API oficial e não depende de scraping do site de tradução."""
     kwargs_mymemory = {"email": MYMEMORY_EMAIL} if MYMEMORY_EMAIL else {}
 
-    engines = [
-        lambda: traduzir_deepl(texto, origem, destino),
+    engines = []
+
+    if usar_deepl and _deepl_disponivel() and _deepl_suporta(origem, destino):
+        engines.append(lambda: traduzir_deepl(texto, origem, destino))
+
+    engines.append(
         lambda: MyMemoryTranslator(
             source=_origem_mymemory(origem, texto),
             target=_codigo_mymemory(destino),
             **kwargs_mymemory,
-        ).translate(texto),
-    ]
+        ).translate(texto)
+    )
 
     ultimo_erro: Optional[Exception] = None
 
@@ -235,6 +288,7 @@ def traduzir_cache(texto: str, origem: str, destino: str):
         try:
             resultado = engine()
         except Exception as e:
+            _registrar_falha_deepl(e)
             ultimo_erro = e
             continue
 
@@ -249,7 +303,7 @@ def traduzir_cache(texto: str, origem: str, destino: str):
     raise ultimo_erro or RuntimeError("Nenhum motor de tradução disponível")
 
 
-def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 3):
+def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 2, usar_deepl: bool = True):
     """Tenta traduzir com pequenas re-tentativas para absorver falhas
     passageiras (timeout, instabilidade momentânea). traduzir_cache já cai do
     Google pro MyMemory sozinho quando o Google falha; esse retry aqui cobre
@@ -258,15 +312,15 @@ def traduzir_com_retry(texto: str, origem: str, destino: str, tentativas: int = 
 
     for tentativa in range(tentativas):
         try:
-            return traduzir_cache(texto, origem, destino)
+            return traduzir_cache(texto, origem, destino, usar_deepl)
         except Exception as e:
             ultima_excecao = e
             if tentativa < tentativas - 1:
-                time.sleep(0.4 * (tentativa + 1))
+                time.sleep(0.2)
 
     if origem != "auto":
         try:
-            return traduzir_cache(texto, "auto", destino)
+            return traduzir_cache(texto, "auto", destino, usar_deepl)
         except Exception as e:
             ultima_excecao = e
 
@@ -282,13 +336,18 @@ def get_analisador_sentimento() -> SentimentIntensityAnalyzer:
     return SentimentIntensityAnalyzer()
 
 @lru_cache(maxsize=1000)
-def classificar_sentimento_cache(texto: str) -> str:
+def classificar_sentimento_cache(texto: str, idioma: str = "auto") -> str:
     """
     VADER só entende inglês, então traduzimos o texto antes de
     analisar — reaproveitando o mesmo tradutor já usado
     no restante do projeto, sem depender de modelos pesados."""
     try:
-        texto_em_ingles = traduzir_texto_longo(texto, "auto", "en")
+        if idioma.lower().split("-")[0] == "en":
+            # já está em inglês: economiza uma chamada ao DeepL
+            texto_em_ingles = texto
+        else:
+            origem = idioma if idioma in CODIGOS_VALIDOS else "auto"
+            texto_em_ingles = traduzir_texto_longo(texto, origem, "en")
     except Exception:
         texto_em_ingles = texto
 
@@ -545,23 +604,77 @@ def _dividir_paragrafo_longo(paragrafo: str, limite: int) -> list[str]:
 
     return blocos
 
-def traduzir_texto_longo(texto: str, origem: str, destino: str) -> str:
-    """Traduz o texto parágrafo a parágrafo e remonta com o mesmo
-    separador ("\\n\\n"), preservando a estrutura de parágrafos e itens de
-    lista sem depender do tradutor manter quebras de linha em blocos
-    grandes de texto."""
+DEEPL_MAX_TEXTOS_POR_REQUISICAO = 50
+
+# Pool compartilhado só para o fallback (MyMemory), que exige blocos pequenos.
+_executor_fallback = ThreadPoolExecutor(max_workers=8, thread_name_prefix="traducao-fallback")
+
+
+def traduzir_paragrafos_deepl(paragrafos: list[str], origem: str, destino: str) -> list[str]:
+    """Envia todos os parágrafos ao DeepL em UMA requisição (até 50 por vez),
+    em vez de uma requisição por parágrafo. O limite de 480 caracteres não se
+    aplica aqui: ele existe só por causa do MyMemory."""
+    client = get_deepl_client()
+
+    target_lang = _codigo_deepl(destino, destino=True)
+    source_lang = None if origem == "auto" else _codigo_deepl(origem)
+
+    traduzidos: list[str] = []
+    for i in range(0, len(paragrafos), DEEPL_MAX_TEXTOS_POR_REQUISICAO):
+        lote = paragrafos[i:i + DEEPL_MAX_TEXTOS_POR_REQUISICAO]
+        respostas = client.translate_text(
+            lote,
+            source_lang=source_lang,
+            target_lang=target_lang,
+        )
+        if not isinstance(respostas, list):
+            respostas = [respostas]
+        traduzidos.extend(r.text for r in respostas)
+
+    return traduzidos
+
+
+def _traduzir_fallback_paralelo(paragrafos: list[str], origem: str, destino: str) -> str:
+    """Fallback (MyMemory): traduz os parágrafos em paralelo, preservando a ordem."""
+
+    def traduzir_paragrafo(paragrafo: str) -> str:
+        blocos = _dividir_paragrafo_longo(paragrafo, LIMITE_CHARS_TRADUCAO)
+        partes = [
+            traduzir_com_retry(bloco, origem, destino, usar_deepl=False)
+            for bloco in blocos
+        ]
+        return " ".join(partes)
+
+    return "\n\n".join(_executor_fallback.map(traduzir_paragrafo, paragrafos))
+
+
+@lru_cache(maxsize=1000)
+def _traduzir_texto_longo_cache(texto: str, origem: str, destino: str) -> str:
     paragrafos = dividir_em_paragrafos(texto)
 
     if not paragrafos:
         return ""
 
-    traduzidos = []
-    for paragrafo in paragrafos:
-        blocos = _dividir_paragrafo_longo(paragrafo, LIMITE_CHARS_TRADUCAO)
-        partes_traduzidas = [traduzir_com_retry(bloco, origem, destino) for bloco in blocos]
-        traduzidos.append(" ".join(partes_traduzidas))
+    # 1) DeepL em lote (caminho rápido)
+    if _deepl_disponivel() and _deepl_suporta(origem, destino):
+        try:
+            traduzidos = traduzir_paragrafos_deepl(paragrafos, origem, destino)
+            if len(traduzidos) == len(paragrafos) and all(t and t.strip() for t in traduzidos):
+                return "\n\n".join(traduzidos)
+        except Exception as e:
+            _registrar_falha_deepl(e)
+            traceback.print_exc()
 
-    return "\n\n".join(traduzidos)
+    # 2) Fallback: MyMemory, em paralelo
+    return _traduzir_fallback_paralelo(paragrafos, origem, destino)
+
+
+def traduzir_texto_longo(texto: str, origem: str, destino: str) -> str:
+    """Traduz o texto preservando a estrutura de parágrafos ("\\n\\n").
+
+    Caminho principal: todos os parágrafos vão ao DeepL numa única chamada.
+    Há cache por (texto, origem, destino); exceções não são cacheadas."""
+    return _traduzir_texto_longo_cache(texto, origem, destino)
 
 FONTE_UNICODE_NOME = "DejaVuSans"
 
@@ -726,6 +839,17 @@ def limitar_historico(db: Session, usuario_id: int, limite: int = LIMITE_HISTORI
             .delete(synchronize_session=False)
         db.commit()
 
+def limitar_historico_em_background(usuario_id: int) -> None:
+    """Roda a limpeza do histórico DEPOIS da resposta, com sessão própria
+    (a sessão do request pode já estar fechada quando isto executa)."""
+    db = SessionLocal()
+    try:
+        limitar_historico(db, usuario_id)
+    except Exception:
+        traceback.print_exc()
+    finally:
+        db.close()
+
 def registrar_traducao(
     db: Session,
     authorization: Optional[str],
@@ -734,6 +858,7 @@ def registrar_traducao(
     origem: str,
     destino: str,
     modo: str,
+    background: Optional[BackgroundTasks] = None,
 ) -> Optional[int]:
     """Salva o registro de tradução no histórico do usuário, se autenticado.
     Falhas aqui não devem quebrar a resposta ao usuário, mas devem ser logadas."""
@@ -782,17 +907,45 @@ def registrar_traducao(
         db.commit()
         db.refresh(registro)
 
-        limitar_historico(db, usuario.id)
+        if background is not None:
+            background.add_task(limitar_historico_em_background, usuario.id)
+        else:
+            limitar_historico(db, usuario.id)
 
         return registro.id
     except Exception:
         traceback.print_exc()
         return None
 
+def registrar_traducao_em_background(
+    authorization: Optional[str],
+    texto: str,
+    traducao: str,
+    origem: str,
+    destino: str,
+    modo: str,
+) -> None:
+    """Grava no histórico DEPOIS da resposta, com sessão própria (a sessão
+    do request já pode estar fechada quando isto roda)."""
+    if not (authorization and authorization.startswith("Bearer ")):
+        return
+
+    db = SessionLocal()
+    try:
+        registrar_traducao(
+            db, authorization,
+            texto=texto, traducao=traducao,
+            origem=origem, destino=destino, modo=modo,
+        )
+    except Exception:
+        traceback.print_exc()
+    finally:
+        db.close()
+
 @router.post("/traduzir")
 def traduzir(
     request: TraducaoRequest,
-    db: Session = Depends(get_db),
+    background: BackgroundTasks,
     authorization: Optional[str] = Header(default=None)
 ):
     validar_idiomas(request.origem, request.destino)
@@ -806,29 +959,32 @@ def traduzir(
     except Exception:
         raise HTTPException(status_code=500, detail="Erro ao traduzir texto")
 
-    registro_id = registrar_traducao(
-        db, authorization,
-        texto=request.texto,
-        traducao=texto_traduzido,
-        origem=request.origem,
-        destino=request.destino,
-        modo=request.modo,
+    # O front (TextoTraducao.tsx) não usa o "id" desta resposta: o histórico é
+    # recarregado via GET /historico. Então gravamos depois de responder.
+    background.add_task(
+        registrar_traducao_em_background,
+        authorization,
+        request.texto,
+        texto_traduzido,
+        request.origem,
+        request.destino,
+        request.modo,
     )
 
     return {
-        "id": registro_id,
+        "id": None,
         "traducao": texto_traduzido
     }
 
 @router.post("/analisar-sentimento")
-def analisar_sentimento(request: SentimentoRequest):
+def analisar_sentimento(request: SentimentoRequest, idioma: str = "auto"):
     texto = request.texto.strip()
 
     if not texto:
         raise HTTPException(status_code=400, detail="Texto vazio")
 
     try:
-        sentimento = classificar_sentimento_cache(texto)
+        sentimento = classificar_sentimento_cache(texto, idioma)
     except Exception:
         raise HTTPException(status_code=500, detail="Erro ao analisar sentimento")
 
@@ -895,6 +1051,7 @@ def apagar_todo_historico(usuario: Usuario = Depends(get_usuario_atual), db: Ses
 
 @router.post("/traduzir-imagem")
 async def traduzir_imagem(
+    background: BackgroundTasks,
     file: UploadFile = File(...),
     origem: str = Form(...),
     destino: str = Form(...),
@@ -992,6 +1149,7 @@ async def traduzir_imagem(
             origem=origem,
             destino=destino,
             modo="imagem",
+            background=background,
         )
 
         return {
@@ -1007,6 +1165,7 @@ async def traduzir_imagem(
 
 @router.post("/traduzir-voz")
 async def traduzir_voz(
+    background: BackgroundTasks,
     file: UploadFile = File(...),
     origem: str = Form(...),
     destino: str = Form(...),
@@ -1041,6 +1200,7 @@ async def traduzir_voz(
             origem=origem,
             destino=destino,
             modo="voz",
+            background=background,
         )
 
         return {
