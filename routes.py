@@ -233,8 +233,8 @@ _MAPA_ORIGEM_DEEPL = {
 }
 
 
-DEEPL_TENTATIVAS = 3
-DEEPL_PRAZO_MAXIMO_SEGUNDOS = 4.0     # quanto uma requisição aceita esperar pelo DeepL
+DEEPL_TENTATIVAS = 6
+DEEPL_PRAZO_MAXIMO_SEGUNDOS = 8.0     # quanto uma requisição aceita esperar pelo DeepL
 DEEPL_COOLDOWN_BASE_SEGUNDOS = 0.5    # 1º 429 seguido -> 0,5 s; depois 1 s, 2 s, 3 s (teto)
 DEEPL_COOLDOWN_MAXIMO_SEGUNDOS = 3.0
 
