@@ -132,7 +132,7 @@ MYMEMORY_PAUSA_APOS_LIMITE_SEGUNDOS = 30
 _mymemory_indisponivel_ate = 0.0
 
 # Limita chamadas simultâneas ao DeepL: melhor fazer fila do que tomar 429.
-_deepl_semaforo = threading.BoundedSemaphore(8)
+_deepl_semaforo = threading.BoundedSemaphore(5)
 
 
 def _mymemory_disponivel() -> bool:
@@ -234,7 +234,9 @@ _MAPA_ORIGEM_DEEPL = {
 
 
 DEEPL_TENTATIVAS = 3
-DEEPL_BACKOFF_BASE_SEGUNDOS = 0.3
+DEEPL_PRAZO_MAXIMO_SEGUNDOS = 4.0     # quanto uma requisição aceita esperar pelo DeepL
+DEEPL_COOLDOWN_BASE_SEGUNDOS = 0.5    # 1º 429 seguido -> 0,5 s; depois 1 s, 2 s, 3 s (teto)
+DEEPL_COOLDOWN_MAXIMO_SEGUNDOS = 3.0
 
 _ERROS_TRANSITORIOS_DEEPL = tuple(
     classe
@@ -245,24 +247,72 @@ _ERROS_TRANSITORIOS_DEEPL = tuple(
     if isinstance(classe, type)
 )
 
+# Cool-down COMPARTILHADO: depois de um 429, NINGUÉM envia ao DeepL até esse
+# instante; quem chega espera (até o prazo máximo) em vez de falhar ou de
+# disparar mais requisições. Retry imediato de todo mundo só mantém o limite estourado.
+_deepl_espera_ate = 0.0
+_deepl_429_seguidos = 0
+
+
+def _deepl_aguardar_vez(prazo: float) -> bool:
+    """Bloqueia até o cool-down acabar. Devolve False se isso estouraria o prazo."""
+    while True:
+        agora = time.monotonic()
+        restante = _deepl_espera_ate - agora
+        if restante <= 0:
+            return True
+        if agora + restante > prazo:
+            return False
+        time.sleep(restante + random.random() * 0.05)
+
+
+def _deepl_registrar_429(enviado_em: float) -> None:
+    global _deepl_espera_ate, _deepl_429_seguidos
+    with _deepl_lock:
+        # Só escala se a requisição foi enviada DEPOIS do último cool-down
+        # (ou seja, ele não foi suficiente). Retardatárias de antes não escalam.
+        if enviado_em >= _deepl_espera_ate:
+            _deepl_429_seguidos = min(_deepl_429_seguidos + 1, 4)
+        n = max(_deepl_429_seguidos, 1)
+        pausa = min(DEEPL_COOLDOWN_BASE_SEGUNDOS * (2 ** (n - 1)), DEEPL_COOLDOWN_MAXIMO_SEGUNDOS)
+        pausa *= 0.75 + random.random() * 0.5          # jitter
+        _deepl_espera_ate = max(_deepl_espera_ate, time.monotonic() + pausa)
+
+
+def _deepl_registrar_sucesso(enviado_em: float) -> None:
+    global _deepl_429_seguidos
+    if enviado_em >= _deepl_espera_ate:
+        with _deepl_lock:
+            _deepl_429_seguidos = 0
+
 
 def _deepl_chamar(funcao):
-    """Executa uma chamada ao DeepL com (a) limite de chamadas simultâneas e
-    (b) retry com backoff exponencial + jitter para erros transitórios (429 /
-    conexão), como a documentação do DeepL recomenda. O sleep acontece FORA do
-    semáforo, para não segurar vaga enquanto espera. Pior caso: ~1,4 s extra.
-    Cota esgotada não é transitória: falha na hora."""
-    for tentativa in range(DEEPL_TENTATIVAS):
+    """Executa uma chamada ao DeepL com limite de simultaneidade e cool-down
+    compartilhado após 429. Cota esgotada não é transitória: falha na hora."""
+    prazo = time.monotonic() + DEEPL_PRAZO_MAXIMO_SEGUNDOS
+    ultimo_erro = None
+
+    for _ in range(DEEPL_TENTATIVAS):
+        if not _deepl_aguardar_vez(prazo):
+            break
+
+        enviado_em = time.monotonic()
         try:
             with _deepl_semaforo:
-                return funcao()
+                resultado = funcao()
+            _deepl_registrar_sucesso(enviado_em)
+            return resultado
         except Exception as e:
+            ultimo_erro = e
             transitorio = bool(_ERROS_TRANSITORIOS_DEEPL) and isinstance(e, _ERROS_TRANSITORIOS_DEEPL)
-            if not transitorio or tentativa == DEEPL_TENTATIVAS - 1:
+            if not transitorio:
                 raise
-            espera = DEEPL_BACKOFF_BASE_SEGUNDOS * (2 ** tentativa) * (0.5 + random.random())
-            print(f"[DeepL] {type(e).__name__}; nova tentativa em {espera:.2f}s ({tentativa + 1}/{DEEPL_TENTATIVAS - 1})", flush=True)
-            time.sleep(espera)
+            if type(e).__name__ == "TooManyRequestsException":
+                _deepl_registrar_429(enviado_em)
+
+    if ultimo_erro is not None:
+        raise ultimo_erro
+    raise RuntimeError("DeepL em cool-down após 429 (prazo máximo de espera atingido)")
 
 
 def traduzir_deepl(texto: str, origem: str, destino: str) -> str:
