@@ -40,6 +40,7 @@ import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 from datetime import datetime, date
 import os
+import random
 import traceback
 import time
 
@@ -96,10 +97,10 @@ def get_deepl_client():
         raise RuntimeError("DEEPL_API_KEY não configurada")
 
     try:
-        return deepl.DeepLClient(DEEPL_API_KEY, max_retries=1, timeout_s=30)
+        return deepl.DeepLClient(DEEPL_API_KEY, max_retries=0, timeout_s=30)
     except TypeError:
         try:
-            deepl.http_client.max_network_retries = 1
+            deepl.http_client.max_network_retries = 0
             deepl.http_client.min_connection_timeout = 30.0
         except Exception:
             pass
@@ -160,7 +161,13 @@ def _registrar_falha_deepl(erro: Exception, motor: str = "DeepL") -> None:
         return
 
     cota_esgotada = type(erro).__name__ == "QuotaExceededException"
-    pausa = DEEPL_PAUSA_APOS_COTA_SEGUNDOS if cota_esgotada else DEEPL_PAUSA_APOS_LIMITE_SEGUNDOS
+    if not cota_esgotada:
+        # 429 comum ("servidores sob carga"): o retry com backoff já cuida disso.
+        # Pausar o DeepL aqui derrubava TODAS as requisições por alguns segundos
+        # por causa de um único 429.
+        return
+
+    pausa = DEEPL_PAUSA_APOS_COTA_SEGUNDOS
 
     with _deepl_lock:
         _deepl_indisponivel_ate = time.monotonic() + pausa
@@ -226,6 +233,38 @@ _MAPA_ORIGEM_DEEPL = {
 }
 
 
+DEEPL_TENTATIVAS = 3
+DEEPL_BACKOFF_BASE_SEGUNDOS = 0.3
+
+_ERROS_TRANSITORIOS_DEEPL = tuple(
+    classe
+    for classe in (
+        getattr(deepl, nome, None)
+        for nome in ("TooManyRequestsException", "ConnectionException")
+    )
+    if isinstance(classe, type)
+)
+
+
+def _deepl_chamar(funcao):
+    """Executa uma chamada ao DeepL com (a) limite de chamadas simultâneas e
+    (b) retry com backoff exponencial + jitter para erros transitórios (429 /
+    conexão), como a documentação do DeepL recomenda. O sleep acontece FORA do
+    semáforo, para não segurar vaga enquanto espera. Pior caso: ~1,4 s extra.
+    Cota esgotada não é transitória: falha na hora."""
+    for tentativa in range(DEEPL_TENTATIVAS):
+        try:
+            with _deepl_semaforo:
+                return funcao()
+        except Exception as e:
+            transitorio = bool(_ERROS_TRANSITORIOS_DEEPL) and isinstance(e, _ERROS_TRANSITORIOS_DEEPL)
+            if not transitorio or tentativa == DEEPL_TENTATIVAS - 1:
+                raise
+            espera = DEEPL_BACKOFF_BASE_SEGUNDOS * (2 ** tentativa) * (0.5 + random.random())
+            print(f"[DeepL] {type(e).__name__}; nova tentativa em {espera:.2f}s ({tentativa + 1}/{DEEPL_TENTATIVAS - 1})", flush=True)
+            time.sleep(espera)
+
+
 def traduzir_deepl(texto: str, origem: str, destino: str) -> str:
     """Traduz usando a API oficial do DeepL.
     Se a origem for 'auto', o DeepL faz a detecção automaticamente."""
@@ -234,12 +273,11 @@ def traduzir_deepl(texto: str, origem: str, destino: str) -> str:
     target_lang = _codigo_deepl(destino, destino=True)
     source_lang = None if origem == "auto" else _codigo_deepl(origem)
 
-    with _deepl_semaforo:
-        resultado = client.translate_text(
-            texto,
-            source_lang=source_lang,
-            target_lang=target_lang,
-        )
+    resultado = _deepl_chamar(lambda: client.translate_text(
+        texto,
+        source_lang=source_lang,
+        target_lang=target_lang,
+    ))
 
     return resultado.text
 
@@ -714,12 +752,11 @@ def traduzir_paragrafos_deepl(paragrafos: list[str], origem: str, destino: str) 
 
     traduzidos: list[str] = []
     for lote in _montar_lotes_deepl(pedacos):
-        with _deepl_semaforo:
-            respostas = client.translate_text(
-                lote,
-                source_lang=source_lang,
-                target_lang=target_lang,
-            )
+        respostas = _deepl_chamar(lambda lote=lote: client.translate_text(
+            lote,
+            source_lang=source_lang,
+            target_lang=target_lang,
+        ))
         if not isinstance(respostas, list):
             respostas = [respostas]
         traduzidos.extend(r.text for r in respostas)
@@ -768,7 +805,6 @@ def _traduzir_texto_longo_cache(texto: str, origem: str, destino: str) -> str:
                 return "\n\n".join(traduzidos)
         except Exception as e:
             _registrar_falha_deepl(e)
-            traceback.print_exc()
 
     # 2) Fallback: MyMemory, em paralelo
     return _traduzir_fallback_paralelo(paragrafos, origem, destino)
@@ -784,9 +820,10 @@ def traduzir_texto_longo_ou_http(texto: str, origem: str, destino: str) -> str:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Os serviços de tradução atingiram o limite de uso no momento. "
-                "Tente novamente em alguns minutos."
+                "Os serviços de tradução estão sobrecarregados no momento. "
+                "Tente novamente em instantes."
             ),
+            headers={"Retry-After": "2"},
         )
 
 
